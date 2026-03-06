@@ -295,7 +295,7 @@ bool load_model(const std::string& path, Model& model) {
     fclose(f);
 
     // Pack attention K+V weights for fused GEMM
-    // Also pack Q+Gate+K+V into single wqkv for decode (saves 1 cuBLAS call per layer)
+    // Also pack Q+Gate+K+V into single wqkv for decode (saves 1 GEMV call per layer)
     {
         int kv_dim = ModelConfig::n_head_kv * ModelConfig::head_dim;  // 1024
         int q_dim = ModelConfig::n_head * ModelConfig::head_dim * 2;  // 8192 (Q+Gate)
@@ -385,15 +385,10 @@ bool load_model(const std::string& path, Model& model) {
 
     printf("Model loaded successfully.\n");
 
-    // Initialize cuBLAS
-    CUBLAS_CHECK(cublasCreate(&model.cublas_handle));
-    CUBLAS_CHECK(cublasSetMathMode(model.cublas_handle, CUBLAS_DEFAULT_MATH));
-
     return true;
 }
 
 void free_model(Model& model) {
-    cublasDestroy(model.cublas_handle);
     // Note: in production, track and free all allocations
     // For now, process exit handles cleanup
 }

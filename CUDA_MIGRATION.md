@@ -1,15 +1,17 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 5 — Kernel Fusion & Profiling
+## Status: Phase 6 — cuBLAS Eliminated
 
-Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on both prompt eval and generation.
+Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dependencies**. Beats llama.cpp on both prompt eval and generation using only custom GEMV and wmma tensor-core GEMM kernels.
 
 ## Performance (RTX 5090, BF16)
 
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
-| Prompt eval (94 tok) | **1835 tok/s** | 563 tok/s | **3.26×** |
-| Generation | **92.5 tok/s** | 77.8 tok/s | **1.19×** |
+| Prompt eval (112 tok) | **1790 tok/s** | 563 tok/s | **3.18×** |
+| Generation | **90.7 tok/s** | 77.8 tok/s | **1.17×** |
+| Binary size | **532 KB** | ~150 MB | 283× smaller |
+| Dependencies | cudart only | cuBLAS, cuDNN, etc. | — |
 
 ## Phase 2 Optimizations Applied
 
@@ -50,6 +52,11 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 - **Packed decode params**: Single 16-byte memcpy for token_id+position+kv_len (3→1 memcpy)
 - **Built-in profiling**: `PROFILE=1` env var for per-category GPU timing breakdown
 
+### cuBLAS Elimination (Phase 6)
+- **Custom GEMV kernel**: Vectorized 128-bit loads from DRAM, L2-cached x vector, bf162 packed operations, warp-level reduction. 8 warps/block = 8 rows/block. Matches cuBLAS within 2% for decode (memory-bound).
+- **wmma Tensor Core GEMM**: 64×64×16 tiled GEMM using `nvcuda::wmma` API for prompt eval. 4 warps (2×2), each computing 32×32 via 2×2 wmma 16×16 tiles. Achieves 97.5% of cuBLAS prompt throughput.
+- **Zero BLAS dependency**: Only links `libcudart.so`. Binary: 532KB (vs ~150MB with cuBLAS). No cuBLAS workspace allocation (~120ms startup saved).
+
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)
 - Pre-allocated decode buffers (avoids per-token cudaMalloc)
@@ -84,8 +91,9 @@ Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention):
 
 - **Total weight bytes**: 13.7 GB/token (BF16)
 - **Theoretical minimum**: 13.7 GB / 1792 GB/s = 7.65 ms/tok (131 tok/s)
-- **Actual (graph mode)**: ~10.8 ms/tok (92.5 tok/s) = **79% bandwidth utilization**
-- **Gap breakdown**: cuBLAS per-GEMV fixed latency (~3-5µs × 129 calls), non-GEMM compute (1.3ms), DRAM access pattern overhead
+- **Actual (graph mode, custom GEMV)**: ~11.0 ms/tok (90.7 tok/s) = **76% bandwidth utilization**
+- **Actual (graph mode, cuBLAS)**: ~10.8 ms/tok (92.5 tok/s) = **79% bandwidth utilization**
+- **Gap analysis**: Custom GEMV GEMM total is actually faster (10.02 vs 10.58 ms/tok in profiling), but CUDA graph launch characteristics differ slightly (-1.8%)
 
 ### cuBLAS Overhead Investigation
 

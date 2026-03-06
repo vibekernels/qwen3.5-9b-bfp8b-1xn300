@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_bf16.h>
-#include <cublas_v2.h>
 #include <cstdint>
 
 // Model hyperparameters (from GGUF metadata)
@@ -117,8 +116,6 @@ struct Model {
     // Flat index: layer_index -> {type, index_within_type}
     int layer_type[ModelConfig::n_layers];     // 0 = attention, 1 = SSM
     int layer_subidx[ModelConfig::n_layers];   // index within attn_layers or ssm_layers
-
-    cublasHandle_t cublas_handle;
 
     // Inference state buffers (hidden state in f32 for precision, like ggml)
     float*         hidden_state;     // [max_tokens, n_embd]  working buffer (f32 residual stream)

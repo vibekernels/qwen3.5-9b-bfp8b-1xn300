@@ -4,7 +4,8 @@
 #include "tokenizer.h"
 #include "sampling.h"
 #include <cuda_bf16.h>
-#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <mma.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -81,7 +82,7 @@ void launch_fused_ssm_step_batched(__nv_bfloat16* output, float* state,
 using MC = ModelConfig;
 
 // Vectorized GEMV: y[N] = W[N,K] @ x[K], bf16 weights × bf16 input → bf16/f32 output
-// Uses shared memory for x vector, 128-bit vectorized loads for weights.
+// L2-cache optimized: x vector (~8KB) stays in L2, no shared memory needed.
 // Each warp processes one row. 8 warps/block = 8 rows/block.
 // Requires K divisible by 8 (true for all our GEMM sizes).
 template<bool F32_OUTPUT>
@@ -91,36 +92,26 @@ __global__ void fast_gemv_kernel(
     const __nv_bfloat16* __restrict__ x,  // [K]
     int N, int K
 ) {
-    extern __shared__ __nv_bfloat16 sx[];  // [K] in shared memory
-
-    const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
-    const int row = blockIdx.x * 8 + warp_id;  // 8 warps = 8 rows per block
-
-    // Cooperatively load x into shared memory using 128-bit loads
-    const int K8 = K / 8;  // number of uint4 chunks
-    uint4* sx_v = reinterpret_cast<uint4*>(sx);
-    const uint4* x_v = reinterpret_cast<const uint4*>(x);
-    for (int i = tid; i < K8; i += 256) {
-        sx_v[i] = x_v[i];
-    }
-    __syncthreads();
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int row = blockIdx.x * 8 + warp_id;
 
     if (row >= N) return;
 
-    // Vectorized dot product: each thread handles K8/32 chunks (128-bit each)
+    const int K8 = K / 8;
     const uint4* W_v = reinterpret_cast<const uint4*>(&W[(int64_t)row * K]);
+    const uint4* x_v = reinterpret_cast<const uint4*>(x);
     float acc = 0.0f;
 
     for (int i = lane_id; i < K8; i += 32) {
         uint4 wc = W_v[i];
-        uint4 xc = sx_v[i];
-        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wc);
-        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xc);
+        uint4 xc = x_v[i];
+        const __nv_bfloat162* wb2 = reinterpret_cast<const __nv_bfloat162*>(&wc);
+        const __nv_bfloat162* xb2 = reinterpret_cast<const __nv_bfloat162*>(&xc);
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        for (int j = 0; j < 4; j++) {
+            float2 p = __bfloat1622float2(__hmul2(wb2[j], xb2[j]));
+            acc += p.x + p.y;
         }
     }
 
@@ -141,19 +132,151 @@ __global__ void fast_gemv_kernel(
 static void launch_gemv_bf16(__nv_bfloat16* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
     int N, int K, cudaStream_t stream) {
     int blocks = cdiv(N, 8);
-    size_t smem = K * sizeof(__nv_bfloat16);
-    fast_gemv_kernel<false><<<blocks, 256, smem, stream>>>(y, W, x, N, K);
+    fast_gemv_kernel<false><<<blocks, 256, 0, stream>>>(y, W, x, N, K);
 }
 
 static void launch_gemv_bf16_f32out(float* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
     int N, int K, cudaStream_t stream) {
     int blocks = cdiv(N, 8);
-    size_t smem = K * sizeof(__nv_bfloat16);
-    fast_gemv_kernel<true><<<blocks, 256, smem, stream>>>(y, W, x, N, K);
+    fast_gemv_kernel<true><<<blocks, 256, 0, stream>>>(y, W, x, N, K);
 }
 
-// Flag to enable/disable custom GEMV (set via env var CUSTOM_GEMV=1)
-static bool g_use_custom_gemv = false;
+// ============================================================================
+// Tiled GEMM using wmma tensor cores for M>1 (prompt eval)
+// C[M,N] = A[M,K] @ B[N,K]^T, all bf16, output bf16 or f32
+//
+// Block tile: BM=64, BN=64, BK=16.
+// 4 warps (2×2), each warp computes 32×32 via 2×2 wmma 16×16 tiles.
+// ============================================================================
+using namespace nvcuda;
+
+template<bool F32_OUTPUT>
+__global__ void tiled_gemm_kernel(
+    void* __restrict__ C,
+    const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
+    const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (transposed access)
+    int M, int N, int K
+) {
+    static constexpr int BM = 64, BN = 64, BK = 16;
+
+    const int bm = blockIdx.y * BM;
+    const int bn = blockIdx.x * BN;
+
+    // 4 warps arranged 2×2
+    const int warp_id = threadIdx.x / 32;
+    const int warp_row = warp_id / 2;  // 0 or 1
+    const int warp_col = warp_id % 2;  // 0 or 1
+    const int tid = threadIdx.x;
+
+    // Shared memory for tiles (4KB total)
+    __shared__ __nv_bfloat16 As[BM][BK];  // 64×16 = 2KB
+    __shared__ __nv_bfloat16 Bs[BN][BK];  // 64×16 = 2KB
+
+    // 2×2 = 4 wmma accumulators per warp (32×32 output)
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    // K loop
+    for (int bk = 0; bk < K; bk += BK) {
+        // Load A tile [BM, BK] — 128 threads load 64×16 = 1024 elements = 128 uint4's
+        for (int i = tid; i < BM * (BK / 8); i += 128) {
+            int row = i / (BK / 8);
+            int col8 = i % (BK / 8);
+            int gr = bm + row;
+            if (gr < M) {
+                *reinterpret_cast<uint4*>(&As[row][col8 * 8]) =
+                    *reinterpret_cast<const uint4*>(&A[(int64_t)gr * K + bk + col8 * 8]);
+            } else {
+                uint4 z = {0, 0, 0, 0};
+                *reinterpret_cast<uint4*>(&As[row][col8 * 8]) = z;
+            }
+        }
+        // Load B tile [BN, BK]
+        for (int i = tid; i < BN * (BK / 8); i += 128) {
+            int row = i / (BK / 8);
+            int col8 = i % (BK / 8);
+            int gr = bn + row;
+            if (gr < N) {
+                *reinterpret_cast<uint4*>(&Bs[row][col8 * 8]) =
+                    *reinterpret_cast<const uint4*>(&B[(int64_t)gr * K + bk + col8 * 8]);
+            } else {
+                uint4 z = {0, 0, 0, 0};
+                *reinterpret_cast<uint4*>(&Bs[row][col8 * 8]) = z;
+            }
+        }
+        __syncthreads();
+
+        // Each warp computes its 2×2 grid of 16×16 wmma tiles
+        #pragma unroll
+        for (int wi = 0; wi < 2; wi++) {
+            #pragma unroll
+            for (int wj = 0; wj < 2; wj++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
+                wmma::load_matrix_sync(a_frag, &As[warp_row * 32 + wi * 16][0], BK);
+                wmma::load_matrix_sync(b_frag, &Bs[warp_col * 32 + wj * 16][0], BK);
+                wmma::mma_sync(acc[wi][wj], a_frag, b_frag, acc[wi][wj]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store results via shared memory staging
+    // Reuse As+Bs = 4KB for staging (4 warps × 256 floats = 4KB)
+    float* staging = reinterpret_cast<float*>(As);
+    float* warp_staging = staging + warp_id * 256;
+
+    for (int wi = 0; wi < 2; wi++) {
+        for (int wj = 0; wj < 2; wj++) {
+            int out_row = bm + warp_row * 32 + wi * 16;
+            int out_col = bn + warp_col * 32 + wj * 16;
+            if (out_row >= M || out_col >= N) continue;
+
+            if constexpr (F32_OUTPUT) {
+                if (out_row + 16 <= M && out_col + 16 <= N) {
+                    wmma::store_matrix_sync(
+                        &reinterpret_cast<float*>(C)[(int64_t)out_row * N + out_col],
+                        acc[wi][wj], N, wmma::mem_row_major);
+                } else {
+                    wmma::store_matrix_sync(warp_staging, acc[wi][wj], 16, wmma::mem_row_major);
+                    __syncwarp();
+                    const int lane = threadIdx.x % 32;
+                    for (int e = lane; e < 256; e += 32) {
+                        int r = e / 16, c = e % 16;
+                        if (out_row + r < M && out_col + c < N)
+                            reinterpret_cast<float*>(C)[(int64_t)(out_row + r) * N + out_col + c] = warp_staging[e];
+                    }
+                }
+            } else {
+                wmma::store_matrix_sync(warp_staging, acc[wi][wj], 16, wmma::mem_row_major);
+                __syncwarp();
+                const int lane = threadIdx.x % 32;
+                for (int e = lane; e < 256; e += 32) {
+                    int r = e / 16, c = e % 16;
+                    if (out_row + r < M && out_col + c < N)
+                        reinterpret_cast<__nv_bfloat16*>(C)[(int64_t)(out_row + r) * N + out_col + c] =
+                            __float2bfloat16(warp_staging[e]);
+                }
+            }
+        }
+    }
+}
+
+static void launch_tiled_gemm_bf16(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
+    int M, int N, int K, cudaStream_t stream) {
+    dim3 grid(cdiv(N, 64), cdiv(M, 64));
+    tiled_gemm_kernel<false><<<grid, 128, 0, stream>>>(C, A, B, M, N, K);
+}
+
+static void launch_tiled_gemm_f32out(float* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
+    int M, int N, int K, cudaStream_t stream) {
+    dim3 grid(cdiv(N, 64), cdiv(M, 64));
+    tiled_gemm_kernel<true><<<grid, 128, 0, stream>>>(C, A, B, M, N, K);
+}
 
 // Pre-allocated decode buffers (avoid per-token cudaMalloc)
 // Packed as [token_id, position, kv_len, kv_len+1] for single memcpy
@@ -180,142 +303,35 @@ static double sync_and_ms(cudaStream_t s, cudaEvent_t start, cudaEvent_t stop) {
     return (double)ms;
 }
 
-// cuBLAS GEMM wrapper: C = A @ B^T  (row-major), bf16 output
+// GEMM wrapper: C = A @ B^T  (row-major), bf16 output
 // A: [M, K] bf16, B: [N, K] bf16, C: [M, N] bf16
+// M=1: custom GEMV, M>1: wmma tiled GEMM
 static cudaStream_t g_compute_stream = 0;  // set from model.compute_stream
 
 static void gemm_bf16(
-    cublasHandle_t handle,
     __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K
 ) {
-    if (M == 1 && g_use_custom_gemv) {
+    if (M == 1) {
         launch_gemv_bf16(C, B, A, N, K, g_compute_stream);
-        return;
-    }
-    float alpha = 1.0f, beta_val = 0.0f;
-    CUBLAS_CHECK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        B, CUDA_R_16BF, K,
-        A, CUDA_R_16BF, K,
-        &beta_val,
-        C, CUDA_R_16BF, N,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    ));
-}
-
-// bf16 -> f32 cast kernel (matching ggml's to_fp32_cuda)
-__global__ void gemm_bf16_to_f32_kernel(
-    float* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        output[idx] = __bfloat162float(input[idx]);
+    } else {
+        launch_tiled_gemm_bf16(C, A, B, M, N, K, g_compute_stream);
     }
 }
 
-// cuBLAS GEMM wrapper: C = A @ B^T, f32 output
-// For small M (decode): direct f32 output from cuBLAS
-// For large M (batched): bf16 GEMM + cast (cuBLAS has better bf16→bf16 kernels for large M)
-static __nv_bfloat16* g_gemm_bf16_tmp = nullptr;
-static int g_gemm_bf16_tmp_size = 0;
-
+// GEMM wrapper: C = A @ B^T, f32 output
+// M=1: custom GEMV with f32 output, M>1: wmma tiled GEMM with f32 output
 static void gemm_bf16_f32out(
-    cublasHandle_t handle,
     float* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K
 ) {
-    if (M == 1 && g_use_custom_gemv) {
+    if (M == 1) {
         launch_gemv_bf16_f32out(C, B, A, N, K, g_compute_stream);
-        return;
-    }
-    float alpha = 1.0f, beta_val = 0.0f;
-
-    if (M <= 4) {
-        // Small M: direct f32 output saves a cast kernel
-        CUBLAS_CHECK(cublasGemmEx(
-            handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, K,
-            A, CUDA_R_16BF, K,
-            &beta_val,
-            C, CUDA_R_32F, N,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        ));
     } else {
-        // Large M: bf16 GEMM + cast is faster
-        int needed = M * N;
-        if (needed > g_gemm_bf16_tmp_size) {
-            if (g_gemm_bf16_tmp) cudaFree(g_gemm_bf16_tmp);
-            g_gemm_bf16_tmp = cuda_alloc<__nv_bfloat16>(needed);
-            g_gemm_bf16_tmp_size = needed;
-        }
-        CUBLAS_CHECK(cublasGemmEx(
-            handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            N, M, K,
-            &alpha,
-            B, CUDA_R_16BF, K,
-            A, CUDA_R_16BF, K,
-            &beta_val,
-            g_gemm_bf16_tmp, CUDA_R_16BF, N,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        ));
-        gemm_bf16_to_f32_kernel<<<cdiv(needed, 256), 256>>>(C, g_gemm_bf16_tmp, needed);
+        launch_tiled_gemm_f32out(C, A, B, M, N, K, g_compute_stream);
     }
 }
 
-// GEMM: C(f32) = A(f32) @ B(bf16)^T  — matches ggml precision (f32 activations × bf16 weights)
-static void gemm_f32_bf16_f32out(
-    cublasHandle_t handle,
-    float* C, const float* A, const __nv_bfloat16* B,
-    int M, int N, int K
-) {
-    float alpha = 1.0f, beta_val = 0.0f;
-    CUBLAS_CHECK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        B, CUDA_R_16BF, K,
-        A, CUDA_R_32F, K,
-        &beta_val,
-        C, CUDA_R_32F, N,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    ));
-}
-
-// GEMM: C(bf16) = A(f32) @ B(bf16)^T
-static void gemm_f32_bf16_bf16out(
-    cublasHandle_t handle,
-    __nv_bfloat16* C, const float* A, const __nv_bfloat16* B,
-    int M, int N, int K
-) {
-    float alpha = 1.0f, beta_val = 0.0f;
-    CUBLAS_CHECK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        B, CUDA_R_16BF, K,
-        A, CUDA_R_32F, K,
-        &beta_val,
-        C, CUDA_R_16BF, N,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    ));
-}
 
 // f32 -> bf16 cast kernel
 __global__ void f32_to_bf16_kernel(
@@ -438,9 +454,7 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     g_pos_d = g_decode_params_d + 1;
     model.d_kv_len = g_decode_params_d + 2;
     CUDA_CHECK(cudaStreamCreate(&model.compute_stream));
-    cublasSetStream(model.cublas_handle, model.compute_stream);
     g_compute_stream = model.compute_stream;
-    g_use_custom_gemv = (getenv("CUSTOM_GEMV") != nullptr);
     g_profile = (getenv("PROFILE") != nullptr);
     model.decode_graph = nullptr;
     model.decode_graph_exec = nullptr;
@@ -468,7 +482,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
 static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     float* hidden, int n_tokens, int* positions_d, __nv_bfloat16* pending_bf16 = nullptr) {
     auto& lw = model.attn_layers[attn_idx];
-    auto handle = model.cublas_handle;
+
     cudaStream_t s = model.compute_stream;
 
     // 1. RMSNorm (f32 in, bf16 out) — optionally fused with pending residual
@@ -485,18 +499,18 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     __nv_bfloat16* v_proj;
 
     if (n_tokens == 1) {
-        // Decode: packed Q+Gate+K+V in single GEMM (saves 1 cuBLAS call vs separate wq+wkv)
+        // Decode: packed Q+Gate+K+V in single GEMM (saves 1 GEMV call vs separate wq+wkv)
         int qkv_dim = q_gate_dim + 2 * kv_dim;  // 10240
-        gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
+        gemm_bf16(model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
         k_proj = model.qkv_buf + q_gate_dim;
         v_proj = model.qkv_buf + q_gate_dim + kv_dim;
     } else {
         // Batched: separate GEMMs for Q and K/V
-        gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, n_tokens, q_gate_dim, MC::n_embd);
+        gemm_bf16(model.qkv_buf, model.norm_out, lw.wq, n_tokens, q_gate_dim, MC::n_embd);
         k_proj = model.attn_out;
-        gemm_bf16(handle, k_proj, model.norm_out, lw.wk, n_tokens, kv_dim, MC::n_embd);
+        gemm_bf16(k_proj, model.norm_out, lw.wk, n_tokens, kv_dim, MC::n_embd);
         v_proj = model.ffn_buf2;
-        gemm_bf16(handle, v_proj, model.norm_out, lw.wv, n_tokens, kv_dim, MC::n_embd);
+        gemm_bf16(v_proj, model.norm_out, lw.wv, n_tokens, kv_dim, MC::n_embd);
     }
 
     // 5. Deinterleave Q and Gate with a single kernel
@@ -541,18 +555,18 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
         n_tokens * MC::n_head * MC::head_dim, s);
 
     // 10. Output projection -> bf16
-    gemm_bf16(handle, model.attn_out, model.attn_out, lw.wo, n_tokens, MC::n_embd, MC::n_head * MC::head_dim);
+    gemm_bf16(model.attn_out, model.attn_out, lw.wo, n_tokens, MC::n_embd, MC::n_head * MC::head_dim);
 
     // 11. Fused bf16 cast + residual + post-attention norm (saves cast kernel)
     launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
         lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
-    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
+    gemm_bf16(model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
     // down_proj -> bf16
-    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
+    gemm_bf16(model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
     // Decode (n_tokens==1): residual add deferred — fused with next layer's norm
     // Prompt (n_tokens>1): apply residual add here (no cross-layer fusion)
     if (n_tokens > 1) {
@@ -565,7 +579,7 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
 static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     float* hidden, int n_tokens, __nv_bfloat16* pending_bf16 = nullptr) {
     auto& lw = model.ssm_layers[ssm_idx];
-    auto handle = model.cublas_handle;
+
     cudaStream_t s = model.compute_stream;
 
     // 1. RMSNorm (f32 in, bf16 out) — optionally fused with pending residual
@@ -585,7 +599,7 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     if (n_tokens == 1) {
         // Decode: single combined GEMM, use pointer offsets (no copies!)
         static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
-        gemm_bf16_f32out(handle, model.gemm_out, model.norm_out, lw.w_combined, 1, combined_n, MC::n_embd);
+        gemm_bf16_f32out(model.gemm_out, model.norm_out, lw.w_combined, 1, combined_n, MC::n_embd);
 
         qkv_proj    = model.gemm_out;
         z_buf       = model.gemm_out + MC::ssm_conv_channels;
@@ -601,7 +615,7 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
 
         // bf16 GEMM into bf16 temp buffer (reuse ffn_buf which is max_batch * 2*n_ff bf16 — large enough)
         __nv_bfloat16* combined_bf16 = model.ffn_buf;
-        gemm_bf16(handle, combined_bf16, model.norm_out, lw.w_combined, n_tokens, combined_n, MC::n_embd);
+        gemm_bf16(combined_bf16, model.norm_out, lw.w_combined, n_tokens, combined_n, MC::n_embd);
         // Fused deinterleave + bf16→f32 cast
         int total = n_tokens * combined_n;
         deinterleave_ssm_proj_bf16_kernel<<<cdiv(total, 256), 256, 0, s>>>(
@@ -648,18 +662,18 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     }
 
     // 14. Output projection -> bf16
-    gemm_bf16(handle, model.attn_out, model.norm_out, lw.ssm_out, n_tokens, MC::n_embd, MC::ssm_d_inner);
+    gemm_bf16(model.attn_out, model.norm_out, lw.ssm_out, n_tokens, MC::n_embd, MC::ssm_d_inner);
 
     // 15. Fused bf16 cast + residual + post-attention norm
     launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
         lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
-    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
+    gemm_bf16(model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
     // down_proj -> bf16
-    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
+    gemm_bf16(model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
     // Decode: residual add deferred — fused with next layer's norm
     // Prompt: apply residual add here
     if (n_tokens > 1) {
@@ -675,7 +689,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
         return;
     }
     auto& lw = model.attn_layers[attn_idx];
-    auto handle = model.cublas_handle;
+
     cudaStream_t s = model.compute_stream;
 #define PS() cudaEventRecord(t0, s)
 #define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
@@ -694,7 +708,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     int qkv_dim = q_gate_dim + 2 * kv_dim;
 
     PS();
-    gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
+    gemm_bf16(model.qkv_buf, model.norm_out, lw.wqkv, 1, qkv_dim, MC::n_embd);
     PE(attn_gemm_ms);
     __nv_bfloat16* k_proj = model.qkv_buf + q_gate_dim;
     __nv_bfloat16* v_proj = model.qkv_buf + q_gate_dim + kv_dim;
@@ -718,7 +732,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     PE(attn_kernel_ms);
 
     PS();
-    gemm_bf16(handle, model.attn_out, model.attn_out, lw.wo, 1, MC::n_embd, MC::n_head * MC::head_dim);
+    gemm_bf16(model.attn_out, model.attn_out, lw.wo, 1, MC::n_embd, MC::n_head * MC::head_dim);
     PE(attn_gemm_ms);
 
     PS();
@@ -727,7 +741,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     PE(norm_ms);
 
     PS();
-    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+    gemm_bf16(model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
     PE(ffn_gate_up_ms);
 
     PS();
@@ -735,7 +749,7 @@ static void forward_attention_layer_profiled(Model& model, int layer_idx, int at
     PE(ffn_kernel_ms);
 
     PS();
-    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
+    gemm_bf16(model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
     PE(ffn_down_ms);
 
     // bf16_residual_add deferred — fused with next layer's norm
@@ -751,7 +765,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
         return;
     }
     auto& lw = model.ssm_layers[ssm_idx];
-    auto handle = model.cublas_handle;
+
     cudaStream_t s = model.compute_stream;
 #define PS() cudaEventRecord(t0, s)
 #define PE(f) g_prof.f += sync_and_ms(s, t0, t1)
@@ -767,7 +781,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
 
     PS();
     static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
-    gemm_bf16_f32out(handle, model.gemm_out, model.norm_out, lw.w_combined, 1, combined_n, MC::n_embd);
+    gemm_bf16_f32out(model.gemm_out, model.norm_out, lw.w_combined, 1, combined_n, MC::n_embd);
     PE(ssm_gemm_ms);
 
     float* qkv_proj = model.gemm_out;
@@ -791,7 +805,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
     PE(ssm_step_ms);
 
     PS();
-    gemm_bf16(handle, model.attn_out, model.norm_out, lw.ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
+    gemm_bf16(model.attn_out, model.norm_out, lw.ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
     PE(ssm_gemm_ms);
 
     PS();
@@ -800,7 +814,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
     PE(norm_ms);
 
     PS();
-    gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+    gemm_bf16(model.ffn_buf, model.norm_out, lw.ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
     PE(ffn_gate_up_ms);
 
     PS();
@@ -808,7 +822,7 @@ static void forward_ssm_layer_profiled(Model& model, int layer_idx, int ssm_idx,
     PE(ffn_kernel_ms);
 
     PS();
-    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
+    gemm_bf16(model.attn_out, model.ffn_buf, lw.ffn_down, 1, MC::n_embd, MC::n_ff);
     PE(ffn_down_ms);
 
     // bf16_residual_add deferred — fused with next layer's norm
@@ -881,7 +895,7 @@ static void forward_decode_body(Model& model) {
 
     // LM head: [1, 4096] -> [1, 248320] -> f32 logits
     PROF_START();
-    gemm_bf16_f32out(model.cublas_handle, model.logits_f32, model.norm_out, model.output,
+    gemm_bf16_f32out(model.logits_f32, model.norm_out, model.output,
         1, MC::n_vocab, MC::n_embd);
     PROF_END(lm_head_ms);
 
@@ -991,19 +1005,15 @@ int main(int argc, char** argv) {
     int max_kv_len = (int)prompt_tokens.size() + max_gen_tokens + 16;
     allocate_buffers(model, max_batch, max_kv_len);
 
-    // Warm up cuBLAS on compute stream (first call allocates workspace)
+    // Warm up GPU kernels on compute stream
     {
         __nv_bfloat16* dummy_a = model.norm_out;
-        __nv_bfloat16* dummy_b = model.norm_out;
         __nv_bfloat16* dummy_c = model.attn_out;
-        gemm_bf16(model.cublas_handle, dummy_c, dummy_a, dummy_b, 1, 64, 64);
-        // Also warm up the specific GEMM sizes used during decode (cuBLAS caches kernel plans)
-        static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
-        gemm_bf16_f32out(model.cublas_handle, model.gemm_out, dummy_a, model.ssm_layers[0].w_combined, 1, combined_n, MC::n_embd);
-        gemm_bf16(model.cublas_handle, dummy_c, dummy_a, model.ssm_layers[0].ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
-        gemm_bf16(model.cublas_handle, model.ffn_buf, dummy_c, model.ssm_layers[0].ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
-        gemm_bf16(model.cublas_handle, dummy_c, model.ffn_buf, model.ssm_layers[0].ffn_down, 1, MC::n_embd, MC::n_ff);
-        gemm_bf16_f32out(model.cublas_handle, model.logits_f32, dummy_a, model.output, 1, MC::n_vocab, MC::n_embd);
+        // Warm up GEMV with representative sizes
+        gemm_bf16(dummy_c, dummy_a, model.ssm_layers[0].ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
+        gemm_bf16(model.ffn_buf, dummy_c, model.ssm_layers[0].ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+        gemm_bf16(dummy_c, model.ffn_buf, model.ssm_layers[0].ffn_down, 1, MC::n_embd, MC::n_ff);
+        gemm_bf16_f32out(model.logits_f32, dummy_a, model.output, 1, MC::n_vocab, MC::n_embd);
         CUDA_CHECK(cudaStreamSynchronize(model.compute_stream));
     }
 
@@ -1051,7 +1061,7 @@ int main(int argc, char** argv) {
             1, MC::n_embd, MC::rms_norm_eps, s);
 
         // LM head on last token
-        gemm_bf16_f32out(model.cublas_handle, model.logits_f32, model.norm_out, model.output,
+        gemm_bf16_f32out(model.logits_f32, model.norm_out, model.output,
             1, MC::n_vocab, MC::n_embd);
 
         CUDA_CHECK(cudaStreamSynchronize(s));

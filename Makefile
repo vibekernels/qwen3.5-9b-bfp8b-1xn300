@@ -4,8 +4,8 @@ CXX = g++
 # RTX 5090 = SM 12.0
 CUDA_ARCH = -gencode arch=compute_120,code=sm_120
 
-NVCC_FLAGS = $(CUDA_ARCH) -O2 -std=c++17 --use_fast_math -Xcompiler -Wall
-LDFLAGS = -lcublas -lcudart
+NVCC_FLAGS = $(CUDA_ARCH) -O3 -std=c++17 --use_fast_math -Xcompiler -Wall
+LDFLAGS = -lcudart
 
 BUILD_DIR = build
 SRC_DIR = src
