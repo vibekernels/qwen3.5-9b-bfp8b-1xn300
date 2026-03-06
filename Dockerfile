@@ -26,8 +26,9 @@ RUN cd /root/qwen3.5-9b-1x5090 && make -j$(nproc)
 
 WORKDIR /root/qwen3.5-9b-1x5090
 
-# Startup script: configure SSH keys and start sshd, then sleep forever
+# Startup script: configure SSH, download model, start server
 RUN printf '#!/bin/bash\n\
+set -e\n\
 ssh-keygen -A\n\
 if [ -n "$PUBLIC_KEY" ]; then\n\
   mkdir -p /root/.ssh\n\
@@ -39,18 +40,30 @@ printenv | grep -E "^[A-Z_][A-Z0-9_]*=" | grep -v "^PUBLIC_KEY=" | \\\n\
   awk -F = '"'"'{ val=$0; sub(/^[^=]*=/, "", val); print "export " $1 "=\\\"" val "\\\"" }'"'"' > /etc/rp_environment\n\
 grep -q "source /etc/rp_environment" /root/.bashrc 2>/dev/null || \\\n\
   echo "source /etc/rp_environment" >> /root/.bashrc\n\
+/usr/sbin/sshd\n\
+\n\
+# Parse HF_MODEL (format: org/repo-GGUF:quant)\n\
+HF_MODEL="${HF_MODEL:-unsloth/Qwen3.5-9B-GGUF:BF16}"\n\
+REPO="${HF_MODEL%%:*}"\n\
+QUANT="${HF_MODEL##*:}"\n\
+REPO_NAME="${REPO##*/}"\n\
+FILE_STEM="${REPO_NAME%%-GGUF}"\n\
+FILENAME="${FILE_STEM}-${QUANT}.gguf"\n\
+MODEL_PATH="/workspace/models/${FILENAME}"\n\
+\n\
 # Download model weights if not already present\n\
-MODEL_PATH=/workspace/models/Qwen3.5-9B-BF16.gguf\n\
 if [ ! -f "$MODEL_PATH" ]; then\n\
-  echo "Downloading Qwen3.5-9B-BF16 weights..."\n\
-  mkdir -p /root/models\n\
-  wget -q --show-progress -O "$MODEL_PATH" \\\n\
-    "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-BF16.gguf"\n\
+  echo "Downloading ${FILENAME} from ${REPO}..."\n\
+  mkdir -p /workspace/models\n\
+  wget -O "$MODEL_PATH" \\\n\
+    "https://huggingface.co/${REPO}/resolve/main/${FILENAME}"\n\
   echo "Download complete."\n\
 fi\n\
-/usr/sbin/sshd\n\
-sleep infinity\n' > /start.sh && chmod +x /start.sh
+\n\
+# Start the inference server\n\
+exec /root/qwen3.5-9b-1x5090/qwen-server -m "$MODEL_PATH" --host 0.0.0.0 --port 8080\n\
+' > /start.sh && chmod +x /start.sh
 
-EXPOSE 22
+EXPOSE 22 8080
 
 CMD ["/start.sh"]
