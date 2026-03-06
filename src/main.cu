@@ -141,72 +141,6 @@ static void launch_gemv_bf16_f32out(float* y, const __nv_bfloat16* W, const __nv
     fast_gemv_kernel<true><<<blocks, 256, 0, stream>>>(y, W, x, N, K);
 }
 
-// Batched GEMV: C[M,N] = A[M,K] @ B[N,K]^T for small M (2-16)
-// Each warp reads one B row (weight, streaming load) and multiplies against all M A rows (from L2).
-// Weight data loaded once from DRAM regardless of M — gives ~M× speedup over M sequential GEMVs.
-template<bool F32_OUTPUT, int MAX_M>
-__global__ void batched_gemv_kernel(
-    void* __restrict__ C,              // [M, N]
-    const __nv_bfloat16* __restrict__ A, // [M, K] row-major (input tokens)
-    const __nv_bfloat16* __restrict__ B, // [N, K] row-major (weights)
-    int M, int N, int K
-) {
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
-    const int n_row = blockIdx.x * 8 + warp_id;
-    if (n_row >= N) return;
-
-    const int K8 = K / 8;
-    const uint4* B_v = reinterpret_cast<const uint4*>(&B[(int64_t)n_row * K]);
-
-    float acc[MAX_M];
-    #pragma unroll
-    for (int m = 0; m < MAX_M; m++) acc[m] = 0.0f;
-
-    for (int i = lane_id; i < K8; i += 32) {
-        uint4 bc = __ldcs(&B_v[i]);  // weight: streaming load
-        const __nv_bfloat162* bb2 = reinterpret_cast<const __nv_bfloat162*>(&bc);
-
-        #pragma unroll
-        for (int m = 0; m < MAX_M; m++) {
-            if (m >= M) break;
-            const uint4* A_v = reinterpret_cast<const uint4*>(&A[(int64_t)m * K]);
-            uint4 ac = A_v[i];  // input: normal load (stays in L2)
-            const __nv_bfloat162* ab2 = reinterpret_cast<const __nv_bfloat162*>(&ac);
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                float2 p = __bfloat1622float2(__hmul2(bb2[j], ab2[j]));
-                acc[m] += p.x + p.y;
-            }
-        }
-    }
-
-    #pragma unroll
-    for (int m = 0; m < MAX_M; m++) {
-        if (m >= M) break;
-        for (int offset = 16; offset > 0; offset >>= 1)
-            acc[m] += __shfl_down_sync(0xffffffff, acc[m], offset);
-        if (lane_id == 0) {
-            if constexpr (F32_OUTPUT)
-                reinterpret_cast<float*>(C)[(int64_t)m * N + n_row] = acc[m];
-            else
-                reinterpret_cast<__nv_bfloat16*>(C)[(int64_t)m * N + n_row] = __float2bfloat16(acc[m]);
-        }
-    }
-}
-
-static void launch_batched_gemv_bf16(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K, cudaStream_t stream) {
-    int blocks = cdiv(N, 8);
-    batched_gemv_kernel<false, 8><<<blocks, 256, 0, stream>>>(C, A, B, M, N, K);
-}
-
-static void launch_batched_gemv_f32out(float* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K, cudaStream_t stream) {
-    int blocks = cdiv(N, 8);
-    batched_gemv_kernel<true, 8><<<blocks, 256, 0, stream>>>(C, A, B, M, N, K);
-}
-
 // ============================================================================
 // Tiled GEMM using wmma tensor cores for M>1 (prompt eval)
 // C[M,N] = A[M,K] @ B[N,K]^T, all bf16, output bf16 or f32
@@ -371,7 +305,7 @@ static double sync_and_ms(cudaStream_t s, cudaEvent_t start, cudaEvent_t stop) {
 
 // GEMM wrapper: C = A @ B^T  (row-major), bf16 output
 // A: [M, K] bf16, B: [N, K] bf16, C: [M, N] bf16
-// M=1: custom GEMV, M=2..8: batched GEMV, M>8: wmma tiled GEMM
+// M=1: custom GEMV, M>1: wmma tiled GEMM
 static cudaStream_t g_compute_stream = 0;  // set from model.compute_stream
 
 static void gemm_bf16(
@@ -380,22 +314,19 @@ static void gemm_bf16(
 ) {
     if (M == 1) {
         launch_gemv_bf16(C, B, A, N, K, g_compute_stream);
-    } else if (M <= 8) {
-        launch_batched_gemv_bf16(C, A, B, M, N, K, g_compute_stream);
     } else {
         launch_tiled_gemm_bf16(C, A, B, M, N, K, g_compute_stream);
     }
 }
 
 // GEMM wrapper: C = A @ B^T, f32 output
+// M=1: custom GEMV with f32 output, M>1: wmma tiled GEMM with f32 output
 static void gemm_bf16_f32out(
     float* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K
 ) {
     if (M == 1) {
         launch_gemv_bf16_f32out(C, B, A, N, K, g_compute_stream);
-    } else if (M <= 8) {
-        launch_batched_gemv_f32out(C, A, B, M, N, K, g_compute_stream);
     } else {
         launch_tiled_gemm_f32out(C, A, B, M, N, K, g_compute_stream);
     }
@@ -1011,143 +942,6 @@ static int forward_decode(Model& model, int token_id, int position) {
     return sample_token(model.logits_f32, MC::n_vocab, g_temperature);
 }
 
-// ============================================================
-// Speculative Decoding with N-gram Drafting
-// ============================================================
-
-// GPU kernel: verify draft tokens against model logits
-// For each position i (0..n_draft-1), checks if argmax(logits[i]) == draft[i]
-// Writes: result[0] = number of consecutive accepted, result[1] = bonus token (model's prediction at acceptance boundary)
-__global__ void verify_draft_kernel(
-    int* __restrict__ result,          // [2]: n_accepted, bonus_token
-    const float* __restrict__ logits,  // [n_verify, n_vocab]
-    const int* __restrict__ draft,     // [n_draft]
-    int n_draft, int n_vocab
-) {
-    // Single-block kernel: each thread handles a portion of vocab for argmax
-    extern __shared__ char smem_raw[];
-    float* s_vals = reinterpret_cast<float*>(smem_raw);
-    int* s_idxs = reinterpret_cast<int*>(smem_raw + blockDim.x * sizeof(float));
-
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-
-    for (int pos = 0; pos <= n_draft; pos++) {
-        const float* row = logits + (int64_t)pos * n_vocab;
-
-        // Parallel argmax over vocab
-        float best_val = -1e30f;
-        int best_idx = 0;
-        for (int v = tid; v < n_vocab; v += stride) {
-            float val = row[v];
-            if (val > best_val) { best_val = val; best_idx = v; }
-        }
-        s_vals[tid] = best_val;
-        s_idxs[tid] = best_idx;
-        __syncthreads();
-        for (int s = stride / 2; s > 0; s >>= 1) {
-            if (tid < s && s_vals[tid + s] > s_vals[tid]) {
-                s_vals[tid] = s_vals[tid + s];
-                s_idxs[tid] = s_idxs[tid + s];
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            int predicted = s_idxs[0];
-            if (pos < n_draft && predicted != draft[pos]) {
-                // Mismatch at position pos
-                result[0] = pos;
-                result[1] = predicted;  // bonus token
-                return;
-            }
-            if (pos == n_draft) {
-                // All drafts accepted, bonus from last position
-                result[0] = n_draft;
-                result[1] = predicted;
-            }
-        }
-        __syncthreads();
-    }
-}
-
-// Batched verification forward pass: process n_tokens through all layers, compute logits for all
-// Pre-allocated buffers for verify batch (max 8 tokens = 1 + MAX_DRAFT)
-static int* g_verify_tokens_d = nullptr;
-static int* g_verify_pos_d = nullptr;
-static int* g_draft_d = nullptr;
-static int* g_verify_result_d = nullptr;  // [2]: n_accepted, bonus_token
-
-// Batched verification: process 1+n_draft tokens through all layers at once,
-// compute logits for all positions, then verify draft tokens via GPU argmax.
-static void forward_verify_batch(Model& model, const int* token_ids_h, int n_tokens,
-    int start_pos) {
-    cudaStream_t s = model.compute_stream;
-
-    // Allocate persistent buffers on first use
-    if (!g_verify_tokens_d) {
-        g_verify_tokens_d = cuda_alloc<int>(8);
-        g_verify_pos_d = cuda_alloc<int>(8);
-        g_draft_d = cuda_alloc<int>(8);
-        g_verify_result_d = cuda_alloc<int>(2);
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(g_verify_tokens_d, token_ids_h, n_tokens * sizeof(int), cudaMemcpyHostToDevice, s));
-    int positions[8];
-    for (int i = 0; i < n_tokens; i++) positions[i] = start_pos + i;
-    CUDA_CHECK(cudaMemcpyAsync(g_verify_pos_d, positions, n_tokens * sizeof(int), cudaMemcpyHostToDevice, s));
-
-    int kv_params[2] = { model.kv_len, model.kv_len + n_tokens };
-    CUDA_CHECK(cudaMemcpyAsync(model.d_kv_len, kv_params, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
-
-    // Embedding
-    embedding_to_f32_kernel<<<n_tokens, 1024, 0, s>>>(
-        model.hidden_state, model.tok_embd, g_verify_tokens_d, MC::n_embd);
-
-    // All layers
-    for (int il = 0; il < MC::n_layers; il++) {
-        if (MC::is_recurrent(il)) {
-            forward_ssm_layer(model, il, model.layer_subidx[il], model.hidden_state, n_tokens);
-        } else {
-            forward_attention_layer(model, il, model.layer_subidx[il], model.hidden_state, n_tokens, g_verify_pos_d);
-        }
-    }
-
-    // Final norm + LM head on ALL tokens
-    launch_rmsnorm_f32in(model.norm_out, model.hidden_state, model.output_norm,
-        n_tokens, MC::n_embd, MC::rms_norm_eps, s);
-    gemm_bf16_f32out(model.logits_f32, model.norm_out, model.output,
-        n_tokens, MC::n_vocab, MC::n_embd);
-
-    model.kv_len += n_tokens;
-}
-
-// N-gram draft: find recent n-gram match in token history, use following tokens as candidates
-static int ngram_draft(const std::vector<int>& history, int ngram_size, int max_draft,
-    int* draft_tokens) {
-    int hlen = (int)history.size();
-    if (hlen < ngram_size + 1) return 0;
-
-    // Search for the last ngram_size tokens earlier in history
-    for (int start = hlen - ngram_size - 1; start >= 0; start--) {
-        bool match = true;
-        for (int j = 0; j < ngram_size; j++) {
-            if (history[start + j] != history[hlen - ngram_size + j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            int n_draft = 0;
-            for (int j = start + ngram_size; j < hlen && n_draft < max_draft; j++) {
-                draft_tokens[n_draft++] = history[j];
-            }
-            return n_draft;
-        }
-    }
-    return 0;
-}
-
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s -m <model_path> -p <prompt> [-n <max_tokens>] [-t <temperature>]\n", prog);
 }
@@ -1205,9 +999,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate buffers (max_batch = max of prompt size and speculation batch)
+    // Allocate buffers (max_batch = prompt size for batched prefill)
     int max_batch = (int)prompt_tokens.size();
-    if (max_batch < 8) max_batch = 8;  // need room for speculation (1 + max_draft=7)
+    if (max_batch < 1) max_batch = 1;
     int max_kv_len = (int)prompt_tokens.size() + max_gen_tokens + 16;
     allocate_buffers(model, max_batch, max_kv_len);
 
@@ -1284,127 +1078,20 @@ int main(int argc, char** argv) {
     printf("%s", prompt.c_str());
     fflush(stdout);
 
-    // Generate tokens — uses speculative decoding with n-gram drafting
+    // Generate tokens
     std::vector<int> generated;
     auto t_gen_start = std::chrono::high_resolution_clock::now();
 
-    const int MAX_DRAFT = 7;
-    const int NGRAM_SIZE = 3;
-    int draft_buf[MAX_DRAFT];
-
-    // SSM state backup buffers for speculation rollback
-    static constexpr int ssm_recurrent_size = MC::ssm_dt_rank * MC::ssm_head_v_dim * MC::ssm_d_state;
-    static constexpr int ssm_conv_size = (MC::ssm_conv_kernel - 1) * MC::ssm_conv_channels;
-    float* ssm_recurrent_backup[24];
-    float* ssm_conv_backup[24];
-    for (int i = 0; i < 24; i++) {
-        ssm_recurrent_backup[i] = cuda_alloc<float>(ssm_recurrent_size);
-        ssm_conv_backup[i] = cuda_alloc<float>(ssm_conv_size);
-    }
-
-    // Token history for n-gram matching (includes prompt tokens)
-    std::vector<int> history(prompt_tokens.begin(), prompt_tokens.end());
-
-    int spec_rounds = 0, spec_accepted = 0, spec_total_draft = 0;
-    int pos = (int)prompt_tokens.size();
-    int recent_accepted = 0, recent_drafted = 0;  // track recent acceptance for adaptive speculation
-
-    while ((int)generated.size() < max_gen_tokens) {
+    for (int i = 0; i < max_gen_tokens; i++) {
         if (next_token == tokenizer.eos_token_id()) break;
 
         generated.push_back(next_token);
-        history.push_back(next_token);
-        printf("%s", tokenizer.decode(next_token).c_str());
+        std::string tok_str = tokenizer.decode(next_token);
+        printf("%s", tok_str.c_str());
         fflush(stdout);
 
-        // Try n-gram draft (skip if recent accept rate is too low)
-        int n_draft = 0;
-        bool spec_enabled = (recent_drafted < 10 || recent_accepted * 3 > recent_drafted);
-        if (spec_enabled) {
-            n_draft = ngram_draft(history, NGRAM_SIZE, MAX_DRAFT, draft_buf);
-            n_draft = std::min(n_draft, max_gen_tokens - (int)generated.size());
-        }
-
-        if (n_draft > 0 && g_temperature <= 0.0f) {
-            spec_rounds++;
-            spec_total_draft += n_draft;
-
-            cudaStream_t s = model.compute_stream;
-
-            // Save SSM state before speculation (for rollback on rejection)
-            for (int i = 0; i < 24; i++) {
-                CUDA_CHECK(cudaMemcpyAsync(ssm_recurrent_backup[i], model.ssm_recurrent_state[i],
-                    ssm_recurrent_size * sizeof(float), cudaMemcpyDeviceToDevice, s));
-                CUDA_CHECK(cudaMemcpyAsync(ssm_conv_backup[i], model.ssm_conv_state[i],
-                    ssm_conv_size * sizeof(float), cudaMemcpyDeviceToDevice, s));
-            }
-
-            // Build verify batch: [current_token, draft_0, ..., draft_{n-1}]
-            int verify_tokens[8];
-            verify_tokens[0] = next_token;
-            for (int i = 0; i < n_draft; i++) verify_tokens[i + 1] = draft_buf[i];
-
-            // Run batched verification through all layers + LM head
-            forward_verify_batch(model, verify_tokens, 1 + n_draft, pos);
-
-            // Upload draft tokens and verify on GPU
-            CUDA_CHECK(cudaMemcpyAsync(g_draft_d, draft_buf, n_draft * sizeof(int), cudaMemcpyHostToDevice, s));
-            int threads = 1024;
-            size_t smem = threads * (sizeof(float) + sizeof(int));
-            verify_draft_kernel<<<1, threads, smem, s>>>(
-                g_verify_result_d, model.logits_f32, g_draft_d, n_draft, MC::n_vocab);
-
-            int result[2];
-            CUDA_CHECK(cudaMemcpyAsync(result, g_verify_result_d, 2 * sizeof(int), cudaMemcpyDeviceToHost, s));
-            CUDA_CHECK(cudaStreamSynchronize(s));
-
-            int accepted = result[0];
-            int bonus_token = result[1];
-            spec_accepted += accepted;
-            recent_accepted += accepted;
-            recent_drafted += n_draft;
-            // Decay recent counters to adapt to changing patterns
-            if (recent_drafted >= 32) { recent_accepted /= 2; recent_drafted /= 2; }
-
-            // Print and record accepted draft tokens
-            for (int i = 0; i < accepted; i++) {
-                generated.push_back(draft_buf[i]);
-                history.push_back(draft_buf[i]);
-                printf("%s", tokenizer.decode(draft_buf[i]).c_str());
-                fflush(stdout);
-            }
-
-            // Fix KV cache length
-            model.kv_len -= (n_draft - accepted);
-
-            // Restore SSM state and replay accepted tokens
-            if (accepted < n_draft) {
-                for (int i = 0; i < 24; i++) {
-                    CUDA_CHECK(cudaMemcpyAsync(model.ssm_recurrent_state[i], ssm_recurrent_backup[i],
-                        ssm_recurrent_size * sizeof(float), cudaMemcpyDeviceToDevice, s));
-                    CUDA_CHECK(cudaMemcpyAsync(model.ssm_conv_state[i], ssm_conv_backup[i],
-                        ssm_conv_size * sizeof(float), cudaMemcpyDeviceToDevice, s));
-                }
-                // Replay accepted tokens through batched forward to get correct SSM state
-                int n_replay = 1 + accepted;
-                model.kv_len -= n_replay;
-                forward_verify_batch(model, verify_tokens, n_replay, pos);
-            }
-
-            pos += 1 + accepted;
-            next_token = bonus_token;
-
-            // Invalidate CUDA graph
-            if (model.decode_graph_captured) {
-                cudaGraphExecDestroy(model.decode_graph_exec);
-                cudaGraphDestroy(model.decode_graph);
-                model.decode_graph_captured = false;
-            }
-        } else {
-            // Standard single-token decode
-            next_token = forward_decode(model, next_token, pos);
-            pos++;
-        }
+        int pos = (int)prompt_tokens.size() + i;
+        next_token = forward_decode(model, next_token, pos);
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -1417,12 +1104,6 @@ int main(int argc, char** argv) {
     printf("Generated tokens: %zu (%.1f ms, %.1f tok/s)\n",
         generated.size(), gen_ms,
         generated.size() * 1000.0 / gen_ms);
-    if (spec_rounds > 0) {
-        printf("Speculation: %d rounds, %d/%d accepted (%.0f%% accept rate), avg draft %.1f\n",
-            spec_rounds, spec_accepted, spec_total_draft,
-            100.0 * spec_accepted / spec_total_draft,
-            (double)spec_total_draft / spec_rounds);
-    }
 
     if (g_profile && g_profile_tokens > 0) {
         int n = g_profile_tokens;

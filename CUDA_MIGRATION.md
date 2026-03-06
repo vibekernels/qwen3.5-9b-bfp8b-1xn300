@@ -1,16 +1,15 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 7 — N-gram Speculative Decoding
+## Status: Phase 6 — cuBLAS Eliminated
 
-Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dependencies**. Beats llama.cpp on both prompt eval and generation using only custom GEMV and wmma tensor-core GEMM kernels. Now with **n-gram speculative decoding** for up to 4× faster generation on repetitive text.
+Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dependencies**. Beats llama.cpp on both prompt eval and generation using only custom GEMV and wmma tensor-core GEMM kernels.
 
 ## Performance (RTX 5090, BF16)
 
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (112 tok) | **1790 tok/s** | 563 tok/s | **3.18×** |
-| Generation (diverse) | **94.8 tok/s** | 77.8 tok/s | **1.22×** |
-| Generation (repetitive) | **388.8 tok/s** | 77.8 tok/s | **5.0×** |
+| Generation | **94.9 tok/s** | 77.8 tok/s | **1.22×** |
 | Binary size | **532 KB** | ~150 MB | 283× smaller |
 | Dependencies | cudart only | cuBLAS, cuDNN, etc. | — |
 
@@ -57,15 +56,6 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dep
 - **Custom GEMV kernel**: Vectorized 128-bit loads from DRAM, L2-cached x vector, bf162 packed operations, warp-level reduction. 8 warps/block = 8 rows/block. **Streaming loads (`__ldcs`)** for weight data bypass L2 cache, preserving L2 for x-vector and intermediates across ~129 GEMV calls per decode step (+5% tok/s).
 - **wmma Tensor Core GEMM**: 64×64×16 tiled GEMM using `nvcuda::wmma` API for prompt eval. 4 warps (2×2), each computing 32×32 via 2×2 wmma 16×16 tiles. Achieves 97.5% of cuBLAS prompt throughput.
 - **Zero BLAS dependency**: Only links `libcudart.so`. Binary: 532KB (vs ~150MB with cuBLAS). No cuBLAS workspace allocation (~120ms startup saved).
-
-### N-gram Speculative Decoding (Phase 7)
-- **N-gram drafting**: Trigram matching on token history to predict next tokens. Zero-cost drafter (CPU-side pattern matching, no model calls).
-- **Batched verification**: Draft tokens verified through batched forward pass using batched GEMV kernel (M=2-8). Reads weight matrix once for all draft tokens from DRAM — ~1.5× cost for 8 tokens vs 8× for sequential.
-- **Batched GEMV kernel**: Vectorized 128-bit loads, streaming weight loads (`__ldcs`), L2-cached input vectors. 7.2× faster than sequential GEMV at M=8.
-- **SSM state save/restore**: 24 SSM recurrent states (48MB) + conv states (2.3MB) saved before speculation, restored on partial rejection, then replayed with only accepted tokens.
-- **GPU-side verification**: `verify_draft_kernel` does parallel argmax per position and sequential comparison — single kernel launch for all draft positions.
-- **Adaptive speculation**: Tracks recent accept rate, disables speculation when accept rate drops below 33% to avoid regression on diverse text.
-- **Performance**: 388.8 tok/s on repetitive text (4.1× speedup), 94.8 tok/s on diverse text (no regression).
 
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)
