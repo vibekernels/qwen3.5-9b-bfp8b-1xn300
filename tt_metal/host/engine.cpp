@@ -243,22 +243,6 @@ static void rmsnorm(const float* x, const float* w, float* out, int dim) {
     for (int i = 0; i < dim; i++) out[i] = x[i] * rms * w[i];
 }
 
-// ============================================================================
-// RoPE: apply rotary embeddings
-// ============================================================================
-static void apply_rope(float* head, int pos) {
-    for (int p = 0; p < MC::rope_dim / 2; p++) {
-        float freq = 1.0f / powf(MC::rope_freq_base, 2.0f * p / MC::rope_dim);
-        float theta = pos * freq;
-        float cos_t = cosf(theta);
-        float sin_t = sinf(theta);
-        int i0 = p;
-        int i1 = p + MC::rope_dim / 2;
-        float x0 = head[i0], x1 = head[i1];
-        head[i0] = x0 * cos_t - x1 * sin_t;
-        head[i1] = x1 * cos_t + x0 * sin_t;
-    }
-}
 
 // ============================================================================
 // Cached small weights (norms, SSM params — tiny, keep permanently on host)
@@ -413,11 +397,45 @@ static std::vector<float> g_attn_out(MC::n_head * MC::head_dim);
 static std::vector<float> g_acc(MC::head_dim);
 static std::vector<float> g_logits(MC::n_vocab);
 
+
+// ============================================================================
+// Pre-computed RoPE cos/sin tables (avoid trig calls per token)
+// ============================================================================
+static std::vector<float> g_rope_cos;  // [max_ctx * rope_dim/2]
+static std::vector<float> g_rope_sin;  // [max_ctx * rope_dim/2]
+
+static void precompute_rope(int max_ctx) {
+    constexpr int half = MC::rope_dim / 2;
+    g_rope_cos.resize((size_t)max_ctx * half);
+    g_rope_sin.resize((size_t)max_ctx * half);
+    for (int pos = 0; pos < max_ctx; pos++) {
+        for (int p = 0; p < half; p++) {
+            float freq = 1.0f / powf(MC::rope_freq_base, 2.0f * p / MC::rope_dim);
+            float theta = pos * freq;
+            g_rope_cos[pos * half + p] = cosf(theta);
+            g_rope_sin[pos * half + p] = sinf(theta);
+        }
+    }
+}
+
+static void apply_rope_cached(float* head, int pos) {
+    constexpr int half = MC::rope_dim / 2;
+    const float* cos_t = g_rope_cos.data() + pos * half;
+    const float* sin_t = g_rope_sin.data() + pos * half;
+    for (int p = 0; p < half; p++) {
+        int i0 = p, i1 = p + half;
+        float x0 = head[i0], x1 = head[i1];
+        head[i0] = x0 * cos_t[p] - x1 * sin_t[p];
+        head[i1] = x1 * cos_t[p] + x0 * sin_t[p];
+    }
+}
+
 // ============================================================================
 // Forward pass: single decode token
 // Large matmuls on device via ttnn::matmul, small ops on host CPU.
+// Returns pointer to static g_logits buffer (valid until next call).
 // ============================================================================
-static std::vector<float> forward_decode() {
+static float* forward_decode() {
     int pos = g_pos;
     float* norm_out = g_norm_out.data();
     float* residual = g_residual.data();
@@ -504,19 +522,21 @@ static std::vector<float> forward_decode() {
                 // Beta
                 float beta = 1.0f / (1.0f + expf(-beta_raw[vh]));
 
-                float* sh = state.data() + vh * head_k * head_v;
+                // State layout: [head_v, head_k] for contiguous inner-loop access
+                float* sh = state.data() + vh * head_v * head_k;
 
                 // Decay
-                for (int j = 0; j < head_k * head_v; j++) sh[j] *= decay;
+                for (int j = 0; j < head_v * head_k; j++) sh[j] *= decay;
 
-                // Delta update + output
+                // Delta update + output (inner loops now access contiguous memory)
                 for (int i = 0; i < head_v; i++) {
+                    float* row = sh + i * head_k;
                     float sk = 0;
-                    for (int j = 0; j < head_k; j++) sk += sh[j * head_v + i] * k[j];
+                    for (int j = 0; j < head_k; j++) sk += row[j] * k[j];
                     float d = beta * (v[i] - sk);
-                    for (int j = 0; j < head_k; j++) sh[j * head_v + i] += k[j] * d;
+                    for (int j = 0; j < head_k; j++) row[j] += k[j] * d;
                     float out = 0;
-                    for (int j = 0; j < head_k; j++) out += sh[j * head_v + i] * q[j];
+                    for (int j = 0; j < head_k; j++) out += row[j] * q[j];
                     delta_out[vh * head_v + i] = out * ssm_scale;
                 }
             }
@@ -614,11 +634,11 @@ static std::vector<float> forward_decode() {
                     kh[d] = kh[d] * rms * aw.k_norm[d];
             }
 
-            // 4. RoPE
+            // 4. RoPE (using pre-computed tables)
             for (int h = 0; h < MC::n_head; h++)
-                apply_rope(q_heads + h * MC::head_dim, pos);
+                apply_rope_cached(q_heads + h * MC::head_dim, pos);
             for (int h = 0; h < MC::n_head_kv; h++)
-                apply_rope(k_proj + h * MC::head_dim, pos);
+                apply_rope_cached(k_proj + h * MC::head_dim, pos);
 
             // 5. KV cache
             memcpy(g_k_cache[attn_idx].data() + (size_t)pos * kv_dim,
@@ -705,7 +725,7 @@ static std::vector<float> forward_decode() {
     device_gemv(g_mesh2.get(), g_wt.lm_head, MC::n_vocab, MC::n_embd,
                norm_out, logits);
 
-    return std::vector<float>(logits, logits + MC::n_vocab);
+    return logits;
 }
 
 // ============================================================================
@@ -759,6 +779,10 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Caching small weights...\n");
     cache_small_weights(cq);
 
+    // Pre-compute RoPE cos/sin tables
+    printf("Pre-computing RoPE tables for %d positions...\n", max_ctx);
+    precompute_rope(max_ctx);
+
     // Create Tensor wrappers for on-device weight matrices
     printf("Creating weight tensor wrappers...\n");
     create_weight_tensors();
@@ -787,12 +811,13 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         int token = prompt_tokens[i];
         printf("  [prefill token %d/%d: %d]\n", i + 1, (int)prompt_tokens.size(), token);
 
-        const bfloat16* emb = reinterpret_cast<const bfloat16*>(
-            g_model.tok_embd_host.data() + (size_t)token * MC::n_embd);
+        // Bulk bf16→f32 embedding lookup using raw bit ops
+        const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)token * MC::n_embd;
+        uint32_t* hbits = reinterpret_cast<uint32_t*>(g_hidden_f32.data());
         for (int j = 0; j < MC::n_embd; j++)
-            g_hidden_f32[j] = static_cast<float>(emb[j]);
+            hbits[j] = static_cast<uint32_t>(emb[j]) << 16;
 
-        auto logits = forward_decode();
+        const float* logits = forward_decode();
         g_pos++;
 
         // After last prompt token, sample first output
@@ -832,7 +857,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         for (int j = 0; j < MC::n_embd; j++)
             g_hidden_f32[j] = static_cast<float>(emb[j]);
 
-        auto logits = forward_decode();
+        const float* logits = forward_decode();
         g_pos++;
 
         auto t1 = std::chrono::high_resolution_clock::now();
