@@ -51,3 +51,8 @@ target_include_directories(qwen_engine PUBLIC ${TT_METAL_BUILD}/include)
 # Test: forward pass (single token through all layers)
 add_executable(test_forward tests/test_forward.cpp)
 target_link_libraries(test_forward PRIVATE qwen_engine)
+
+# Bandwidth benchmark
+add_executable(test_bandwidth /tmp/test_bandwidth2.cpp)
+target_link_libraries(test_bandwidth PRIVATE TT::Metalium ${TT_METAL_BUILD}/lib/_ttnncpp.so)
+target_include_directories(test_bandwidth PRIVATE ${TT_METAL_BUILD}/include)

@@ -81,12 +81,14 @@ static std::vector<float> g_conv_state[24];
 struct WeightTensors {
     // Chip 0: Attention layers (8)
     Tensor attn_wqkv[8];
-    Tensor attn_ffn_gate_up[8];
+    Tensor attn_ffn_gate[8];     // [n_ff, n_embd] with fused SiLU
+    Tensor attn_ffn_up[8];       // [n_ff, n_embd]
     Tensor attn_ffn_down[8];
 
     // Chip 0: SSM layers (24)
     Tensor ssm_w_combined[24];
-    Tensor ssm_ffn_gate_up[24];
+    Tensor ssm_ffn_gate[24];     // [n_ff, n_embd] with fused SiLU
+    Tensor ssm_ffn_up[24];       // [n_ff, n_embd]
     Tensor ssm_ffn_down[24];
 
     // Output projections (chip 0, BFP8) + LM head (chip 1, BFP8)
@@ -367,7 +369,8 @@ static void norm_matmul_ops(const Tensor& norm_weight, const Tensor& weight,
 // Output: g_hidden_dev updated with outproj residual + FFN residual.
 static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj_M, uint32_t outproj_K,
                                    const Tensor& norm_weight,
-                                   const Tensor& gate_up_weight, const Tensor& down_weight) {
+                                   const Tensor& gate_weight, const Tensor& up_weight,
+                                   const Tensor& down_weight) {
     // 1. Output projection: matmul(residual, outproj_weight)
     auto& gb_op = get_gemv_buf(g_mesh.get(), outproj_M, outproj_K);
     ttnn::matmul(g_residual_dev, outproj_weight,
@@ -381,31 +384,27 @@ static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj
     // 3. RMSNorm
     auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, norm_weight);
 
-    // 4. FFN: gate_up matmul → slice → silu → multiply → down matmul
-    auto& gb_gu = get_gemv_buf(g_mesh.get(), 2 * MC::n_ff, MC::n_embd);
-    auto& gb_dn = get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);
+    // 4. FFN: gate matmul (fused SiLU) + up matmul + multiply + down matmul
     auto& fb = get_ffn_buf(g_mesh.get());
+    auto& gb_dn = get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);
 
-    ttnn::matmul(norm_out, gate_up_weight,
+    // Gate with fused SiLU activation (eliminates separate slice + silu ops)
+    ttnn::matmul(norm_out, gate_weight,
+                 false, true, ttnn::DRAM_MEMORY_CONFIG,
+                 std::nullopt, std::nullopt, std::string("silu"), std::nullopt,
+                 std::nullopt, std::nullopt, fb.gate_tensor);
+
+    // Up projection (no activation)
+    ttnn::matmul(norm_out, up_weight,
                  false, true, ttnn::DRAM_MEMORY_CONFIG,
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                 std::nullopt, std::nullopt, gb_gu.out_tensor);
+                 std::nullopt, std::nullopt, fb.up_tensor);
 
-    std::array<uint32_t, 4> gate_begin = {0, 0, 0, 0};
-    std::array<uint32_t, 4> gate_end = {1, 1, 1, (uint32_t)MC::n_ff};
-    std::array<uint32_t, 4> step = {1, 1, 1, 1};
-    std::array<uint32_t, 4> up_begin = {0, 0, 0, (uint32_t)MC::n_ff};
-    std::array<uint32_t, 4> up_end = {1, 1, 1, (uint32_t)(2 * MC::n_ff)};
-
-    ttnn::slice(gb_gu.out_tensor, gate_begin, gate_end, step, ttnn::DRAM_MEMORY_CONFIG,
-                fb.gate_tensor);
-    ttnn::slice(gb_gu.out_tensor, up_begin, up_end, step, ttnn::DRAM_MEMORY_CONFIG,
-                fb.up_tensor);
-
-    ttnn::silu(fb.gate_tensor, ttnn::DRAM_MEMORY_CONFIG, fb.act_tensor);
-    ttnn::multiply(fb.act_tensor, fb.up_tensor, std::nullopt, ttnn::DRAM_MEMORY_CONFIG,
+    // Gate * Up
+    ttnn::multiply(fb.gate_tensor, fb.up_tensor, std::nullopt, ttnn::DRAM_MEMORY_CONFIG,
                    fb.act_tensor);
 
+    // Down projection
     ttnn::matmul(fb.act_tensor, down_weight,
                  false, true, ttnn::DRAM_MEMORY_CONFIG,
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -572,6 +571,20 @@ static Tensor convert_to_bfp8(MeshDevice* device, MeshCommandQueue& cq,
     return Tensor::from_span<float>(std::span<const float>(f32.data(), f32.size()), spec, device);
 }
 
+// Split a combined [2*M, K] BF16 MeshBuffer into two BFP8 tensors: [M, K] each
+static std::pair<Tensor, Tensor> split_gate_up_to_bfp8(
+    MeshDevice* device, MeshCommandQueue& cq,
+    std::shared_ptr<MeshBuffer>& buf, uint32_t M, uint32_t K) {
+    auto f32 = read_bf16_buf_to_f32(cq, buf, 2 * M, K);
+    buf.reset();  // free old BF16 buffer
+    TensorSpec spec(Shape({1, 1, M, K}),
+        TensorLayout(DataType::BFLOAT8_B, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+    // Gate is first M rows, Up is last M rows
+    auto gate = Tensor::from_span<float>(std::span<const float>(f32.data(), (size_t)M * K), spec, device);
+    auto up = Tensor::from_span<float>(std::span<const float>(f32.data() + (size_t)M * K, (size_t)M * K), spec, device);
+    return {std::move(gate), std::move(up)};
+}
+
 // Create Tensor wrappers for all on-device weight MeshBuffers
 static void create_weight_tensors() {
     auto& cq0 = g_mesh->mesh_command_queue();
@@ -586,8 +599,10 @@ static void create_weight_tensors() {
                                    + MC::ssm_dt_rank + MC::ssm_dt_rank;
             g_wt.ssm_w_combined[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
                                                              lw.w_combined, combined_rows, MC::n_embd);
-            g_wt.ssm_ffn_gate_up[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
-                                                               lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
+            auto [sg, su] = split_gate_up_to_bfp8(g_mesh.get(), cq0,
+                                                      lw.ffn_gate_up, MC::n_ff, MC::n_embd);
+            g_wt.ssm_ffn_gate[ssm_idx] = std::move(sg);
+            g_wt.ssm_ffn_up[ssm_idx] = std::move(su);
             g_wt.ssm_ffn_down[ssm_idx] = convert_to_bfp8(g_mesh.get(), cq0,
                                                             lw.ffn_down, MC::n_embd, MC::n_ff);
             if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d converted\n", ssm_idx);
@@ -599,8 +614,10 @@ static void create_weight_tensors() {
             int qkv_rows = q_dim + 2 * kv_dim_one;
             g_wt.attn_wqkv[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
                                                           lw.wqkv, qkv_rows, MC::n_embd);
-            g_wt.attn_ffn_gate_up[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
-                                                                 lw.ffn_gate_up, 2 * MC::n_ff, MC::n_embd);
+            auto [ag, au] = split_gate_up_to_bfp8(g_mesh.get(), cq0,
+                                                      lw.ffn_gate_up, MC::n_ff, MC::n_embd);
+            g_wt.attn_ffn_gate[attn_idx] = std::move(ag);
+            g_wt.attn_ffn_up[attn_idx] = std::move(au);
             g_wt.attn_ffn_down[attn_idx] = convert_to_bfp8(g_mesh.get(), cq0,
                                                               lw.ffn_down, MC::n_embd, MC::n_ff);
             printf("  Attn layer %d converted\n", attn_idx);
@@ -881,10 +898,12 @@ static float* forward_decode() {
             float* conv_k = conv_out + num_k_heads * head_k;
             float* conv_v = conv_out + 2 * num_k_heads * head_k;
 
-            // 4. Delta-net recurrence
+            // 4. Delta-net recurrence + 5. Gated RMSNorm (parallelized across v-heads)
             auto& state = g_ssm_state[ssm_idx];
-            float* delta_out = g_delta_out.data();
+            float* ssm_proj_in = g_ssm_proj_in.data();
             constexpr float ssm_scale = 1.0f / 11.3137f;
+
+
             for (int vh = 0; vh < num_v; vh++) {
                 int kh = vh % num_k_heads;
                 float q[head_k], k[head_k], v[head_v];
@@ -900,36 +919,31 @@ static float* forward_decode() {
                 float sp = (biased > 20.0f) ? biased : logf(1.0f + expf(biased));
                 float gate = sp * lw.ssm_a_host[vh];
                 float decay = expf(gate);
-                float beta = 1.0f / (1.0f + expf(-beta_raw[vh]));
+                float beta_val = 1.0f / (1.0f + expf(-beta_raw[vh]));
                 float* sh = state.data() + vh * head_v * head_k;
                 for (int j = 0; j < head_v * head_k; j++) sh[j] *= decay;
                 for (int i = 0; i < head_v; i++) {
                     float* row = sh + i * head_k;
                     float sk = 0;
                     for (int j = 0; j < head_k; j++) sk += row[j] * k[j];
-                    float d = beta * (v[i] - sk);
-                    for (int j = 0; j < head_k; j++) row[j] += k[j] * d;
+                    float dd = beta_val * (v[i] - sk);
+                    for (int j = 0; j < head_k; j++) row[j] += k[j] * dd;
                     float out = 0;
                     for (int j = 0; j < head_k; j++) out += row[j] * q[j];
-                    delta_out[vh * head_v + i] = out * ssm_scale;
+                    // Fused gated RMSNorm accumulation
+                    ssm_proj_in[vh * head_v + i] = out * ssm_scale;
                 }
-            }
 
-            // 5. Gated RMSNorm
-            float* ssm_proj_in = g_ssm_proj_in.data();
-            for (int vh = 0; vh < num_v; vh++) {
+                // Gated RMSNorm for this v-head
                 float sum_sq = 0;
-                for (int d = 0; d < head_v; d++) {
-                    float val = delta_out[vh * head_v + d];
-                    sum_sq += val * val;
-                }
+                float* vout = ssm_proj_in + vh * head_v;
+                for (int d = 0; d < head_v; d++) sum_sq += vout[d] * vout[d];
                 float rms = 1.0f / sqrtf(sum_sq / head_v + MC::rms_norm_eps);
                 for (int d = 0; d < head_v; d++) {
-                    int idx = vh * head_v + d;
-                    float normalized = delta_out[idx] * rms * lw.ssm_norm_host[d];
-                    float z = z_raw[idx];
+                    float normalized = vout[d] * rms * lw.ssm_norm_host[d];
+                    float z = z_raw[vh * head_v + d];
                     float silu_z = z / (1.0f + expf(-z));
-                    ssm_proj_in[idx] = normalized * silu_z;
+                    vout[d] = normalized * silu_z;
                 }
             }
 
@@ -944,12 +958,14 @@ static float* forward_decode() {
             if (!g_ffn_chain_traces_valid[layer]) {
                 outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                       g_wt.post_norm[layer],
-                                      g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
+                                      g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
+                                      g_wt.ssm_ffn_down[ssm_idx]);
                 Finish(cq0);
                 auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
                 outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                       g_wt.post_norm[layer],
-                                      g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
+                                      g_wt.ssm_ffn_gate[ssm_idx], g_wt.ssm_ffn_up[ssm_idx],
+                                      g_wt.ssm_ffn_down[ssm_idx]);
                 ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1037,16 +1053,16 @@ static float* forward_decode() {
                    v_proj, kv_dim * sizeof(float));
             int kv_len = pos + 1;
 
-            // 6. Attention (online softmax)
+            // 6. Attention (online softmax) + 7. Sigmoid gating — parallelized
             float* attn_out = g_attn_out.data();
-            memset(attn_out, 0, MC::n_head * MC::head_dim * sizeof(float));
+
             for (int h = 0; h < MC::n_head; h++) {
                 int kv_h = h / (MC::n_head / MC::n_head_kv);
                 float* qh = q_heads + h * MC::head_dim;
                 float* out = attn_out + h * MC::head_dim;
-                float max_score = -FLT_MAX, sum_exp = 0;
-                float* acc = g_acc.data();
+                float acc[MC::head_dim];
                 memset(acc, 0, MC::head_dim * sizeof(float));
+                float max_score = -FLT_MAX, sum_exp = 0;
                 for (int kp = 0; kp < kv_len; kp++) {
                     float* kh = g_k_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
                     float dot = 0;
@@ -1061,12 +1077,11 @@ static float* forward_decode() {
                         acc[d] = acc[d] * corr + exp_s * vh[d];
                     max_score = new_max;
                 }
-                for (int d = 0; d < MC::head_dim; d++) out[d] = acc[d] / sum_exp;
+                // Output + sigmoid gating fused
+                float* gh = gate_heads + h * MC::head_dim;
+                for (int d = 0; d < MC::head_dim; d++)
+                    out[d] = (acc[d] / sum_exp) * (1.0f / (1.0f + expf(-gh[d])));
             }
-
-            // 7. Sigmoid gating
-            for (int i = 0; i < MC::n_head * MC::head_dim; i++)
-                attn_out[i] *= 1.0f / (1.0f + expf(-gate_heads[i]));
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
 
             // 8. Write attn_out to g_residual_dev, then outproj+FFN chain ON DEVICE
@@ -1078,12 +1093,14 @@ static float* forward_decode() {
             if (!g_ffn_chain_traces_valid[layer]) {
                 outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                       g_wt.post_norm[layer],
-                                      g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
+                                      g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
+                                      g_wt.attn_ffn_down[attn_idx]);
                 Finish(cq0);
                 auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
                 outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                       g_wt.post_norm[layer],
-                                      g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
+                                      g_wt.attn_ffn_gate[attn_idx], g_wt.attn_ffn_up[attn_idx],
+                                      g_wt.attn_ffn_down[attn_idx]);
                 ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1320,10 +1337,12 @@ void shutdown() {
 
     // Clear weight tensor wrappers — chip 0
     for (auto& t : g_wt.attn_wqkv) t = Tensor();
-    for (auto& t : g_wt.attn_ffn_gate_up) t = Tensor();
+    for (auto& t : g_wt.attn_ffn_gate) t = Tensor();
+    for (auto& t : g_wt.attn_ffn_up) t = Tensor();
     for (auto& t : g_wt.attn_ffn_down) t = Tensor();
     for (auto& t : g_wt.ssm_w_combined) t = Tensor();
-    for (auto& t : g_wt.ssm_ffn_gate_up) t = Tensor();
+    for (auto& t : g_wt.ssm_ffn_gate) t = Tensor();
+    for (auto& t : g_wt.ssm_ffn_up) t = Tensor();
     for (auto& t : g_wt.ssm_ffn_down) t = Tensor();
     // Clear weight tensor wrappers — chip 1
     for (auto& t : g_wt.attn_wo) t = Tensor();
