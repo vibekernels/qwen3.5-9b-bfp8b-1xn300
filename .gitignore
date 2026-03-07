@@ -7,10 +7,6 @@ dump_ggml_hidden
 # Model data
 data/
 
-# Python
-__pycache__/
-*.pyc
-
 # CUDA
 *.o
 *.cubin
