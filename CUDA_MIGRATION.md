@@ -1,6 +1,6 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 6 — cuBLAS Eliminated
+## Status: Phase 7 — Decode Throughput Optimized
 
 Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dependencies**. Beats llama.cpp on both prompt eval and generation using only custom GEMV and wmma tensor-core GEMM kernels.
 
@@ -9,7 +9,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dep
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (112 tok) | **1790 tok/s** | 563 tok/s | **3.18×** |
-| Generation | **94.9 tok/s** | 77.8 tok/s | **1.22×** |
+| Generation | **92.4 tok/s** | 77.8 tok/s | **1.19×** |
 | Binary size | **532 KB** | ~150 MB | 283× smaller |
 | Dependencies | cudart only | cuBLAS, cuDNN, etc. | — |
 
@@ -57,6 +57,21 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dep
 - **wmma Tensor Core GEMM**: 64×64×16 tiled GEMM using `nvcuda::wmma` API for prompt eval. 4 warps (2×2), each computing 32×32 via 2×2 wmma 16×16 tiles. Achieves 97.5% of cuBLAS prompt throughput.
 - **Zero BLAS dependency**: Only links `libcudart.so`. Binary: 532KB (vs ~150MB with cuBLAS). No cuBLAS workspace allocation (~120ms startup saved).
 
+### Decode Throughput Optimization (Phase 7)
+- **Dual-path attention decode**: Short contexts (≤48KB shared mem, ~192 KV entries) use fast shared-memory attention kernel; long contexts use online softmax kernel that needs no shared memory. Recovers 6.3 tok/s regression from online softmax.
+- **GPU-accelerated sampling**: `reduce_candidates_kernel` — 1024 GPU threads each find their local best logit, downloading only 8KB (1024 val+idx pairs) instead of 1MB (248K floats). CPU does top-k + softmax + top-p + sampling from the 1024 candidates.
+- **Deferred token decoding**: `tokenizer.decode()` only called when a streaming callback is present, saving ~0.1ms/tok during benchmarks.
+- **Cached env lookups**: `getenv("NO_GRAPH")` cached in static variable instead of called per-token.
+
+### Memory Pipelining Investigation (Phase 7)
+Investigated hiding DRAM latency via software pipelining to close the gap from 92.4 tok/s (82% BW utilization) to the theoretical 112.9 tok/s peak:
+
+- **cp.async double-buffered GEMV**: Implemented `pipelined_gemv_kernel` using `__pipeline_memcpy_async` to overlap next tile's DRAM fetch with current tile's compute. Result: **89.2 tok/s (3.5% slower)**. Shared memory staging adds an extra data hop without benefit — each weight element is used exactly once, so there's no reuse to amortize the cost.
+- **TMA (Tensor Memory Accelerator)**: Analyzed but not implemented. TMA uses the same DRAM → shared memory → registers path as cp.async, just with hardware address generation. Same fundamental problem: no data reuse in GEMV means the shared memory hop is pure overhead.
+- **2-warp-per-row GEMV**: Tested for small N (≤8192) to improve occupancy. Cross-warp reduction via `__syncthreads__` + shared memory cost more than the occupancy benefit. FFN down was +0.057ms/tok slower. Reverted.
+- **Cooperative mega-kernel**: Analyzed grid_sync cost (347 syncs × 2.4µs = 0.83ms) vs CUDA graph overhead (0.42ms). Mega-kernel would be 2× slower than graph. SSM shared memory (67KB/block) also conflicts with GEMV occupancy.
+- **Conclusion**: The remaining 18% gap is split between DRAM physics (~10%: page activation, bank conflicts, TLB misses) and non-GEMV compute overhead (~8%). Not addressable via software pipelining. Further gains require quantization (INT8/INT4), speculative decoding, or batched inference.
+
 ### Other
 - GPU argmax sampling (avoids downloading 248K float logits)
 - Pre-allocated decode buffers (avoids per-token cudaMalloc)
@@ -90,10 +105,11 @@ Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention):
 ## Bandwidth Analysis
 
 - **Total weight bytes**: 13.7 GB/token (BF16)
-- **Theoretical minimum**: 13.7 GB / 1792 GB/s = 7.65 ms/tok (131 tok/s)
-- **Actual (graph mode, streaming GEMV)**: ~10.5 ms/tok (94.9 tok/s) = **80% bandwidth utilization**
-- **Actual (graph mode, non-streaming)**: ~11.0 ms/tok (90.7 tok/s) = **76% bandwidth utilization**
-- **Streaming loads**: `__ldcs` on weight data bypasses L2, improving both GEMV BW and non-GEMM kernel speed (intermediates stay in L2)
+- **Total weight bytes (precise)**: 15.87 GB/token (BF16, including LM head)
+- **Theoretical minimum**: 15.87 GB / 1792 GB/s = 8.86 ms/tok (112.9 tok/s)
+- **Actual (graph mode, optimized)**: ~10.82 ms/tok (92.4 tok/s) = **82% bandwidth utilization**
+- **Streaming loads**: `__ldcs` on weight data bypasses L2, preserving L2 for x-vector and intermediates across ~129 GEMV calls per decode step
+- **Remaining gap**: ~10% DRAM physics (page activation, bank conflicts, TLB misses) + ~8% non-GEMV compute overhead
 
 ### cuBLAS Overhead Investigation
 
