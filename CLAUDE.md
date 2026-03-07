@@ -14,14 +14,17 @@
 
 ```sh
 cd tt_metal && mkdir -p build && cd build
-cmake .. -DTT_METAL_BUILD=/home/ubuntu/tt-metal/build_Release
+cmake .. -DTT_METAL_BUILD=/home/ubuntu/tt-metal/build_Release -DCMAKE_CXX_COMPILER=clang++-20
 make -j$(nproc)
 ```
 
 ## Test inference
 
+Requires `sudo` and `TT_METAL_RUNTIME_ROOT`:
+
 ```sh
-./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
+sudo TT_METAL_RUNTIME_ROOT=/home/ubuntu/tt-metal \
+  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
 ## Reference model (llama.cpp)

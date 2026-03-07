@@ -16,20 +16,20 @@ Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (eve
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~290 ms/tok |
-| Decode throughput | ~3.4 tok/s |
+| Decode latency | ~950 ms/tok |
+| Decode throughput | ~1 tok/s |
 | Model size | ~18 GB BF16 |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM).
+Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). First token is slower (~1.1s) due to program cache warmup; subsequent tokens stabilize around 950ms.
 
 ## Building
 
-Requires tt-metal built from source (with `_ttnncpp.so`).
+Requires tt-metal built from source (with `_ttnncpp.so`) and clang-20 (must match tt-metal's compiler).
 
 ```sh
 cd tt_metal
 mkdir -p build && cd build
-cmake .. -DTT_METAL_BUILD=/path/to/tt-metal/build_Release
+cmake .. -DTT_METAL_BUILD=/path/to/tt-metal/build_Release -DCMAKE_CXX_COMPILER=clang++-20
 make -j$(nproc)
 ```
 
@@ -37,19 +37,24 @@ This produces test binaries: `test_device`, `test_matmul`, `test_load_weights`, 
 
 ## Running inference
 
+Requires `sudo` (for device access) and `TT_METAL_RUNTIME_ROOT` pointing to your tt-metal source tree:
+
 ```sh
-./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "What is the capital of France?" 128
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal \
+  ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "What is the capital of France?" 128
 ```
 
 Pass `--raw` as a 4th argument to skip the chat template and send the prompt directly.
 
 ## Tests
 
+All tests require `sudo` and `TT_METAL_RUNTIME_ROOT`:
+
 ```sh
-./build/test_device        # validate N300 device opens correctly
-./build/test_matmul        # basic ttnn::matmul on device
-./build/test_load_weights  # load GGUF weights into device DRAM
-./build/test_forward       # full generation test
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_device        # validate N300 device opens
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic ttnn::matmul
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_load_weights  # GGUF weight loading
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full generation test
 ```
 
 ## Project structure
