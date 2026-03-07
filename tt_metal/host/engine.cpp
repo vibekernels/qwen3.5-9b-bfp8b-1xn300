@@ -8,6 +8,11 @@
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/types.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
+#include <ttnn/operations/trace.hpp>
 #include <ttnn/types.hpp>
 
 #include "engine.h"
@@ -88,8 +93,22 @@ struct WeightTensors {
     Tensor attn_wo[8];           // [n_embd, n_head*head_dim] on chip 1
     Tensor ssm_out[24];          // [n_embd, ssm_d_inner] on chip 1
     Tensor lm_head;              // [n_vocab, n_embd] on chip 1
+
+    // Norm weights as device tensors (for on-device RMSNorm)
+    Tensor attn_norm[32];        // pre-attention norm for each layer
+    Tensor post_norm[32];        // post-attention norm for each layer
+    Tensor output_norm_tensor;   // final output norm
 };
 static WeightTensors g_wt;
+
+// Persistent hidden state on device (avoids PCIe round-trips between layers)
+static std::shared_ptr<MeshBuffer> g_hidden_dev_buf;
+static Tensor g_hidden_dev;
+static std::shared_ptr<MeshBuffer> g_residual_dev_buf;
+static Tensor g_residual_dev;
+// Temp buffer for matmul input after rms_norm (on device)
+static std::shared_ptr<MeshBuffer> g_norm_dev_buf;
+static Tensor g_norm_dev;
 
 // Wrap an existing on-device MeshBuffer as a ttnn Tensor for use with ttnn::matmul
 static Tensor wrap_weight(std::shared_ptr<MeshBuffer> buf, uint32_t M, uint32_t K) {
@@ -183,12 +202,25 @@ static inline float bf16_to_f32(uint16_t b) {
 // Pre-allocated bf16 scratch for bulk conversion (max possible K or M)
 static std::vector<uint16_t> g_bf16_scratch(MC::n_vocab_padded);
 
+// Per-matmul trace storage: indexed by a sequential ID per unique weight
+struct GemvTrace {
+    ttnn::MeshTraceId trace_id;
+    bool valid = false;
+};
+static GemvTrace g_gemv_traces[128];  // max 65 unique matmuls + headroom
+
+// Detailed timing counters for device_gemv sub-operations
+static double g_t_tilize = 0, g_t_enqueue = 0, g_t_dispatch = 0, g_t_read = 0, g_t_host = 0;
+static int g_gemv_count = 0;
+
 static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, uint32_t K,
-                        const float* x, float* y) {
+                        const float* x, float* y, int trace_idx = -1) {
+    using Clock = std::chrono::high_resolution_clock;
     auto& gb = get_gemv_buf(device, M, K);
     auto& cq = device->mesh_command_queue();
 
-    // 1. Bulk convert f32→bf16, then scatter into tile positions via memcpy
+    // 1. Host-side tilize + PCIe write
+    auto t0 = Clock::now();
     uint16_t* scratch = g_bf16_scratch.data();
     const uint32_t* xbits = reinterpret_cast<const uint32_t*>(x);
     for (uint32_t i = 0; i < K; i++)
@@ -202,23 +234,41 @@ static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, ui
         memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
         memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
     }
+    auto t0b = Clock::now();
     EnqueueWriteMeshBuffer(cq, gb.act_buf, gb.act_host_tiled, false);
+    auto t1 = Clock::now();
 
-    // 2. matmul: [1,1,1,K] × [1,1,M,K]^T = [1,1,1,M]
-    ttnn::matmul(gb.act_tensor, weight,
-                 /*transpose_a=*/false, /*transpose_b=*/true,
-                 /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
-                 /*dtype=*/std::nullopt,
-                 /*program_config=*/std::nullopt,
-                 /*activation=*/std::nullopt,
-                 /*compute_kernel_config=*/std::nullopt,
-                 /*core_grid=*/std::nullopt,
-                 /*output_tile=*/std::nullopt,
-                 /*optional_output_tensor=*/gb.out_tensor);
+    // 2. matmul dispatch (with optional trace)
+    auto do_matmul = [&]() {
+        ttnn::matmul(gb.act_tensor, weight,
+                     false, true, ttnn::DRAM_MEMORY_CONFIG,
+                     std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                     std::nullopt, std::nullopt, gb.out_tensor);
+    };
 
-    // 3. Read result, gather row 0 from tiles via memcpy, bulk convert bf16→f32
+    if (trace_idx >= 0 && trace_idx < 128) {
+        auto& tr = g_gemv_traces[trace_idx];
+        if (!tr.valid) {
+            do_matmul();
+            EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
+            auto tid = ttnn::operations::trace::begin_trace_capture(device, std::nullopt);
+            do_matmul();
+            ttnn::operations::trace::end_trace_capture(device, tid, std::nullopt);
+            tr.trace_id = tid;
+            tr.valid = true;
+        } else {
+            ttnn::operations::trace::execute_trace(device, tr.trace_id, std::nullopt, false);
+        }
+    } else {
+        do_matmul();
+    }
+    auto t2 = Clock::now();
+
+    // 3. Blocking read (waits for device compute + PCIe DMA)
     EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
+    auto t3 = Clock::now();
 
+    // 4. Host-side untilize + convert
     const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
     uint32_t out_tile_cols = gb.M_padded / TILE_WIDTH;
     for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
@@ -227,9 +277,163 @@ static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, ui
         memcpy(scratch + base, oht + tile_off, 16 * sizeof(uint16_t));
         memcpy(scratch + base + 16, oht + tile_off + 256, 16 * sizeof(uint16_t));
     }
-    // Bulk bf16→f32 conversion
     uint32_t* ybits = reinterpret_cast<uint32_t*>(y);
     for (uint32_t i = 0; i < M; i++)
+        ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
+    auto t4 = Clock::now();
+
+    g_t_tilize += std::chrono::duration<double, std::milli>(t0b - t0).count();
+    g_t_enqueue += std::chrono::duration<double, std::milli>(t1 - t0b).count();
+    g_t_dispatch += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    g_t_read += std::chrono::duration<double, std::milli>(t3 - t2).count();
+    g_t_host += std::chrono::duration<double, std::milli>(t4 - t3).count();
+    g_gemv_count++;
+}
+
+// ============================================================================
+// Pre-allocated intermediate buffers for on-device FFN
+// ============================================================================
+struct FfnBuf {
+    // Intermediates for gate/up split + SiLU + multiply
+    std::shared_ptr<MeshBuffer> gate_buf;   // [1, n_ff] tiled
+    Tensor gate_tensor;
+    std::shared_ptr<MeshBuffer> up_buf;     // [1, n_ff] tiled
+    Tensor up_tensor;
+    std::shared_ptr<MeshBuffer> act_buf;    // [1, n_ff] tiled (silu result / multiply result)
+    Tensor act_tensor;
+    bool initialized = false;
+};
+static std::map<MeshDevice*, FfnBuf> g_ffn_bufs;
+
+static FfnBuf& get_ffn_buf(MeshDevice* device) {
+    auto it = g_ffn_bufs.find(device);
+    if (it != g_ffn_bufs.end()) return it->second;
+
+    FfnBuf buf;
+    uint32_t n_ff_padded = ((MC::n_ff + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
+    uint32_t n_ff_tiles = n_ff_padded / TILE_WIDTH;
+    uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+    DeviceLocalBufferConfig dram_cfg{.page_size = tile_bytes, .buffer_type = BufferType::DRAM};
+
+    buf.gate_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = n_ff_tiles * tile_bytes},
+                                       dram_cfg, device);
+    buf.up_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = n_ff_tiles * tile_bytes},
+                                     dram_cfg, device);
+    buf.act_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = n_ff_tiles * tile_bytes},
+                                      dram_cfg, device);
+
+    TensorSpec half_spec(
+        Shape({1, 1, 1, n_ff_padded}),
+        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+
+    buf.gate_tensor = Tensor(DeviceStorage(buf.gate_buf, {MeshCoordinate(0, 0)}),
+                              half_spec, TensorTopology{});
+    buf.up_tensor = Tensor(DeviceStorage(buf.up_buf, {MeshCoordinate(0, 0)}),
+                            half_spec, TensorTopology{});
+    buf.act_tensor = Tensor(DeviceStorage(buf.act_buf, {MeshCoordinate(0, 0)}),
+                             half_spec, TensorTopology{});
+    buf.initialized = true;
+
+    auto [ins, _] = g_ffn_bufs.emplace(device, std::move(buf));
+    printf("  [ffn_buf] allocated n_ff=%u intermediates on device\n", MC::n_ff);
+    return ins->second;
+}
+
+// ============================================================================
+// Per-layer FFN trace captures (avoids dispatch overhead on replay)
+// ============================================================================
+static ttnn::MeshTraceId g_ffn_traces[32];
+static bool g_ffn_traces_valid[32] = {};
+
+// Run FFN device operations (for capture or direct execution)
+static void ffn_device_ops(MeshDevice* device, const Tensor& gate_up_weight,
+                           const Tensor& down_weight) {
+    auto& gb_gu = get_gemv_buf(device, 2 * MC::n_ff, MC::n_embd);
+    auto& gb_dn = get_gemv_buf(device, MC::n_embd, MC::n_ff);
+    auto& fb = get_ffn_buf(device);
+
+    ttnn::matmul(gb_gu.act_tensor, gate_up_weight,
+                 false, true, ttnn::DRAM_MEMORY_CONFIG,
+                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, gb_gu.out_tensor);
+
+    std::array<uint32_t, 4> gate_begin = {0, 0, 0, 0};
+    std::array<uint32_t, 4> gate_end = {1, 1, 1, (uint32_t)MC::n_ff};
+    std::array<uint32_t, 4> step = {1, 1, 1, 1};
+    std::array<uint32_t, 4> up_begin = {0, 0, 0, (uint32_t)MC::n_ff};
+    std::array<uint32_t, 4> up_end = {1, 1, 1, (uint32_t)(2 * MC::n_ff)};
+
+    ttnn::slice(gb_gu.out_tensor, gate_begin, gate_end, step, ttnn::DRAM_MEMORY_CONFIG,
+                fb.gate_tensor);
+    ttnn::slice(gb_gu.out_tensor, up_begin, up_end, step, ttnn::DRAM_MEMORY_CONFIG,
+                fb.up_tensor);
+
+    ttnn::silu(fb.gate_tensor, ttnn::DRAM_MEMORY_CONFIG, fb.act_tensor);
+    ttnn::multiply(fb.act_tensor, fb.up_tensor, std::nullopt, ttnn::DRAM_MEMORY_CONFIG,
+                   fb.act_tensor);
+
+    ttnn::matmul(fb.act_tensor, down_weight,
+                 false, true, ttnn::DRAM_MEMORY_CONFIG,
+                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, gb_dn.out_tensor);
+}
+
+// Device-side FFN with trace capture/replay
+static void device_ffn(MeshDevice* device, int layer_idx,
+                       const Tensor& gate_up_weight,
+                       const Tensor& down_weight,
+                       const float* x_in, float* y_out) {
+    auto& gb_gu = get_gemv_buf(device, 2 * MC::n_ff, MC::n_embd);
+    auto& gb_dn = get_gemv_buf(device, MC::n_embd, MC::n_ff);
+    auto& cq = device->mesh_command_queue();
+
+    // 1. Write x_in to device
+    uint16_t* scratch = g_bf16_scratch.data();
+    const uint32_t* xbits = reinterpret_cast<const uint32_t*>(x_in);
+    for (uint32_t i = 0; i < (uint32_t)MC::n_embd; i++)
+        scratch[i] = static_cast<uint16_t>(xbits[i] >> 16);
+
+    uint16_t* ht = reinterpret_cast<uint16_t*>(gb_gu.act_host_tiled.data());
+    uint32_t num_tile_cols = gb_gu.K_padded / TILE_WIDTH;
+    for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
+        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+        uint32_t base = tc * TILE_WIDTH;
+        memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
+        memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
+    }
+    EnqueueWriteMeshBuffer(cq, gb_gu.act_buf, gb_gu.act_host_tiled, false);
+
+    // 2. Execute FFN ops (capture trace on first call, replay on subsequent)
+    if (!g_ffn_traces_valid[layer_idx]) {
+        // First call: warm up program cache
+        ffn_device_ops(device, gate_up_weight, down_weight);
+        EnqueueReadMeshBuffer(cq, gb_dn.out_host_tiled, gb_dn.out_buf, true);
+
+        // Capture trace for subsequent calls
+        auto tid = ttnn::operations::trace::begin_trace_capture(device, std::nullopt);
+        ffn_device_ops(device, gate_up_weight, down_weight);
+        ttnn::operations::trace::end_trace_capture(device, tid, std::nullopt);
+        g_ffn_traces[layer_idx] = tid;
+        g_ffn_traces_valid[layer_idx] = true;
+    } else {
+        // Replay captured trace (single dispatch for all FFN ops)
+        ttnn::operations::trace::execute_trace(device, g_ffn_traces[layer_idx],
+                                                std::nullopt, false);
+        EnqueueReadMeshBuffer(cq, gb_dn.out_host_tiled, gb_dn.out_buf, true);
+    }
+
+    // 3. Untilize + convert result
+    const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb_dn.out_host_tiled.data());
+    uint32_t out_tile_cols = gb_dn.M_padded / TILE_WIDTH;
+    for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+        uint32_t base = tc * TILE_WIDTH;
+        memcpy(scratch + base, oht + tile_off, 16 * sizeof(uint16_t));
+        memcpy(scratch + base + 16, oht + tile_off + 256, 16 * sizeof(uint16_t));
+    }
+    uint32_t* ybits = reinterpret_cast<uint32_t*>(y_out);
+    for (uint32_t i = 0; i < (uint32_t)MC::n_embd; i++)
         ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
 }
 
@@ -435,7 +639,11 @@ static void apply_rope_cached(float* head, int pos) {
 // Large matmuls on device via ttnn::matmul, small ops on host CPU.
 // Returns pointer to static g_logits buffer (valid until next call).
 // ============================================================================
+static int g_decode_count = 0;
+static double g_time_gemv = 0, g_time_ffn = 0, g_time_ssm = 0, g_time_attn = 0, g_time_lmhead = 0;
+
 static float* forward_decode() {
+    using Clock = std::chrono::high_resolution_clock;
     int pos = g_pos;
     float* norm_out = g_norm_out.data();
     float* residual = g_residual.data();
@@ -454,9 +662,11 @@ static float* forward_decode() {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
-            // 1. Combined projection via DEVICE matmul
+            // 1. Combined projection via DEVICE matmul (trace idx 0-23)
+            auto t_gemv0 = Clock::now();
             device_gemv(g_mesh.get(), g_wt.ssm_w_combined[ssm_idx], g_combined_rows, MC::n_embd,
-                       norm_out, g_proj.data());
+                       norm_out, g_proj.data(), ssm_idx);
+            g_time_gemv += std::chrono::duration<double, std::milli>(Clock::now() - t_gemv0).count();
 
             float* qkv_raw = g_proj.data();
             float* z_raw = g_proj.data() + MC::ssm_conv_channels;
@@ -559,10 +769,12 @@ static float* forward_decode() {
                 }
             }
 
-            // 6. Output projection (DEVICE matmul on chip 1)
+            // 6. Output projection (DEVICE matmul on chip 1, trace idx 24-47)
+            auto t_gemv1 = Clock::now();
             float* layer_out = g_layer_out.data();
             device_gemv(g_mesh2.get(), g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                       ssm_proj_in, layer_out);
+                       ssm_proj_in, layer_out, 24 + ssm_idx);
+            g_time_gemv += std::chrono::duration<double, std::milli>(Clock::now() - t_gemv1).count();
 
             // 7. Residual
             for (int i = 0; i < MC::n_embd; i++)
@@ -570,23 +782,14 @@ static float* forward_decode() {
 
             memcpy(residual, g_hidden_f32.data(), MC::n_embd * sizeof(float));
 
-            // 8. Post-norm + FFN (DEVICE matmul)
+            // 8. Post-norm + FFN (chained on device)
             rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out, MC::n_embd);
 
-            float* ffn_buf = g_ffn_buf.data();
-            device_gemv(g_mesh.get(), g_wt.ssm_ffn_gate_up[ssm_idx], 2 * MC::n_ff, MC::n_embd,
-                       norm_out, ffn_buf);
-
-            float* ffn_act = g_ffn_act.data();
-            for (int i = 0; i < MC::n_ff; i++) {
-                float g = ffn_buf[i];
-                float u = ffn_buf[MC::n_ff + i];
-                ffn_act[i] = (g / (1.0f + expf(-g))) * u;
-            }
-
+            auto t_ffn0 = Clock::now();
             float* ffn_out = g_ffn_out.data();
-            device_gemv(g_mesh.get(), g_wt.ssm_ffn_down[ssm_idx], MC::n_embd, MC::n_ff,
-                       ffn_act, ffn_out);
+            device_ffn(g_mesh.get(), layer, g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx],
+                      norm_out, ffn_out);
+            g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t_ffn0).count();
 
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + ffn_out[i];
@@ -597,12 +800,14 @@ static float* forward_decode() {
             auto& lw = g_model.attn_layers[attn_idx];
             auto& aw = g_attn_small[attn_idx];
 
-            // 1. QKV projection (DEVICE matmul)
+            // 1. QKV projection (DEVICE matmul, trace idx 48-55)
+            auto t_qkv = Clock::now();
             constexpr int q_dim = MC::n_head * MC::head_dim * 2;
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
             device_gemv(g_mesh.get(), g_wt.attn_wqkv[attn_idx], g_qkv_rows, MC::n_embd,
-                       norm_out, qkv);
+                       norm_out, qkv, 48 + attn_idx);
+            g_time_gemv += std::chrono::duration<double, std::milli>(Clock::now() - t_qkv).count();
 
             // 2. Deinterleave Q and gate
             float* q_heads = g_q_heads.data();
@@ -681,10 +886,12 @@ static float* forward_decode() {
             for (int i = 0; i < MC::n_head * MC::head_dim; i++)
                 attn_out[i] *= 1.0f / (1.0f + expf(-gate_heads[i]));
 
-            // 8. Output projection (DEVICE matmul on chip 1)
+            // 8. Output projection (DEVICE matmul on chip 1, trace idx 56-63)
+            auto t_wo = Clock::now();
             float* layer_out = g_layer_out.data();
             device_gemv(g_mesh2.get(), g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                       attn_out, layer_out);
+                       attn_out, layer_out, 56 + attn_idx);
+            g_time_gemv += std::chrono::duration<double, std::milli>(Clock::now() - t_wo).count();
 
             // 9. Residual
             for (int i = 0; i < MC::n_embd; i++)
@@ -692,23 +899,14 @@ static float* forward_decode() {
 
             memcpy(residual, g_hidden_f32.data(), MC::n_embd * sizeof(float));
 
-            // 10. Post-norm + FFN (DEVICE matmul)
+            // 10. Post-norm + FFN (chained on device)
             rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out, MC::n_embd);
 
-            float* ffn_buf = g_ffn_buf.data();
-            device_gemv(g_mesh.get(), g_wt.attn_ffn_gate_up[attn_idx], 2 * MC::n_ff, MC::n_embd,
-                       norm_out, ffn_buf);
-
-            float* ffn_act = g_ffn_act.data();
-            for (int i = 0; i < MC::n_ff; i++) {
-                float g = ffn_buf[i];
-                float u = ffn_buf[MC::n_ff + i];
-                ffn_act[i] = (g / (1.0f + expf(-g))) * u;
-            }
-
+            auto t_ffn1 = Clock::now();
             float* ffn_out = g_ffn_out.data();
-            device_gemv(g_mesh.get(), g_wt.attn_ffn_down[attn_idx], MC::n_embd, MC::n_ff,
-                       ffn_act, ffn_out);
+            device_ffn(g_mesh.get(), layer, g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx],
+                      norm_out, ffn_out);
+            g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t_ffn1).count();
 
             for (int i = 0; i < MC::n_embd; i++)
                 g_hidden_f32[i] = residual[i] + ffn_out[i];
@@ -720,10 +918,24 @@ static float* forward_decode() {
     // Final norm
     rmsnorm(g_hidden_f32.data(), g_output_norm.data(), norm_out, MC::n_embd);
 
-    // LM head (DEVICE matmul on chip 1)
+    // LM head (DEVICE matmul on chip 1, trace idx 64)
+    auto t_lm = Clock::now();
     float* logits = g_logits.data();
     device_gemv(g_mesh2.get(), g_wt.lm_head, MC::n_vocab, MC::n_embd,
-               norm_out, logits);
+               norm_out, logits, 64);
+    g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
+
+    g_decode_count++;
+    if (g_decode_count % 10 == 0) {
+        int calls = g_gemv_count > 0 ? g_gemv_count : 1;
+        printf("  [profile @%d] gemv=%.0f ffn=%.0f lmhead=%.0f ms/tok\n",
+               g_decode_count,
+               g_time_gemv / g_decode_count,
+               g_time_ffn / g_decode_count,
+               g_time_lmhead / g_decode_count);
+        printf("    gemv: tilize=%.2f enq=%.2f disp=%.2f read=%.2f host=%.2f ms/call (%d calls)\n",
+               g_t_tilize / calls, g_t_enqueue / calls, g_t_dispatch / calls, g_t_read / calls, g_t_host / calls, calls);
+    }
 
     return logits;
 }
@@ -897,7 +1109,24 @@ void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
 
-    // Clear pre-allocated GEMV buffers
+    // Release FFN traces
+    for (int i = 0; i < 32; i++) {
+        if (g_ffn_traces_valid[i]) {
+            ttnn::operations::trace::release_trace(g_mesh.get(), g_ffn_traces[i]);
+            g_ffn_traces_valid[i] = false;
+        }
+    }
+    // Release gemv traces (chip 0: idx 0-23,48-55; chip 1: idx 24-47,56-64)
+    for (int i = 0; i < 128; i++) {
+        if (g_gemv_traces[i].valid) {
+            MeshDevice* dev = (i >= 24 && i <= 47) || (i >= 56) ? g_mesh2.get() : g_mesh.get();
+            ttnn::operations::trace::release_trace(dev, g_gemv_traces[i].trace_id);
+            g_gemv_traces[i].valid = false;
+        }
+    }
+
+    // Clear pre-allocated GEMV and FFN buffers
+    g_ffn_bufs.clear();
     g_gemv_bufs.clear();
 
     // Clear weight tensor wrappers — chip 0

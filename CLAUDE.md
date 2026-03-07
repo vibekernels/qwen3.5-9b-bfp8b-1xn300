@@ -1,3 +1,7 @@
+# Project goals
+
+The point of this project is to write a Tenstorrent accelerator kernel. ALL computation should run on the Tenstorrent N300 device (two Wormhole chips). Do not fall back to pure CPU compute — use the device for matmuls and as many operations as possible. If quantization is needed, do not go below INT8.
+
 # Project structure
 
 - `tt_metal/host/engine.cpp` — inference engine: forward pass, `generate()`, `load_model_and_tokenizer()`
