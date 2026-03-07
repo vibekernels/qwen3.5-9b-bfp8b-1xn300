@@ -32,6 +32,8 @@
 #include <cfloat>
 #include <chrono>
 #include <span>
+#include <map>
+#include <tuple>
 
 using namespace tt::constants;
 using namespace tt;
@@ -100,28 +102,119 @@ static Tensor wrap_weight(std::shared_ptr<MeshBuffer> buf, uint32_t M, uint32_t 
 }
 
 // ============================================================================
+// Pre-allocated device buffers for fast GEMV (avoids per-call alloc/dealloc)
+// ============================================================================
+struct GemvBuf {
+    std::shared_ptr<MeshBuffer> act_buf;    // device-side activation buffer
+    Tensor act_tensor;                       // wraps act_buf
+    std::vector<bfloat16> act_host_tiled;   // pre-allocated host tilized buffer
+    uint32_t K_padded;
+
+    std::shared_ptr<MeshBuffer> out_buf;    // device-side output buffer
+    Tensor out_tensor;                       // wraps out_buf
+    std::vector<bfloat16> out_host_tiled;   // pre-allocated host read buffer
+    uint32_t M_padded;
+};
+
+// Map from (device_ptr, K, M) -> pre-allocated buffers
+static std::map<std::tuple<MeshDevice*, uint32_t, uint32_t>, GemvBuf> g_gemv_bufs;
+
+static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
+    auto key = std::make_tuple(device, K, M);
+    auto it = g_gemv_bufs.find(key);
+    if (it != g_gemv_bufs.end()) return it->second;
+
+    // Create new pre-allocated buffers
+    GemvBuf buf;
+    uint32_t TW = TILE_WIDTH, TH = TILE_HEIGHT;
+    buf.K_padded = ((K + TW - 1) / TW) * TW;
+    buf.M_padded = ((M + TW - 1) / TW) * TW;
+
+    uint32_t act_tiles = buf.K_padded / TW;
+    uint32_t out_tiles = buf.M_padded / TW;
+    uint32_t tile_bytes = TH * TW * sizeof(bfloat16);
+
+    DeviceLocalBufferConfig dram_cfg{.page_size = tile_bytes, .buffer_type = BufferType::DRAM};
+
+    buf.act_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = act_tiles * tile_bytes},
+                                      dram_cfg, device);
+    buf.act_host_tiled.resize(act_tiles * TH * TW, bfloat16(0.0f));
+
+    // Wrap as Tensor
+    TensorSpec act_spec(
+        Shape({1, 1, 1, buf.K_padded}),
+        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+    buf.act_tensor = Tensor(DeviceStorage(buf.act_buf, {MeshCoordinate(0, 0)}),
+                            act_spec, TensorTopology{});
+
+    // Output buffer
+    buf.out_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = out_tiles * tile_bytes},
+                                      dram_cfg, device);
+    buf.out_host_tiled.resize(out_tiles * TH * TW, bfloat16(0.0f));
+
+    TensorSpec out_spec(
+        Shape({1, 1, 1, buf.M_padded}),
+        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+    buf.out_tensor = Tensor(DeviceStorage(buf.out_buf, {MeshCoordinate(0, 0)}),
+                            out_spec, TensorTopology{});
+
+    auto [ins, _] = g_gemv_bufs.emplace(key, std::move(buf));
+    printf("  [gemv_buf] allocated K=%u M=%u on device\n", K, M);
+    return ins->second;
+}
+
+// ============================================================================
 // Device-side GEMV: y[M] = W[M,K] @ x[K]  (W on device, x/y on host)
-// device param specifies which chip to upload activation to (must match weight)
+// Pre-allocated buffers eliminate per-call alloc/dealloc overhead.
 // ============================================================================
 static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, uint32_t K,
                         const float* x, float* y) {
-    // Upload activation vector to the same device as the weight
-    TensorSpec act_spec(
-        Shape({1, 1, 1, K}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    auto act = Tensor::from_span<float>(
-        std::span<const float>(x, K), act_spec, device);
+    auto& gb = get_gemv_buf(device, M, K);
+    auto& cq = device->mesh_command_queue();
 
-    // matmul: [1,1,1,K] × [1,1,M,K]^T = [1,1,1,M]
-    auto result = ttnn::matmul(act, weight, /*transpose_a=*/false, /*transpose_b=*/true);
+    // 1. Fast tilize activation [1, K] into pre-allocated host buffer
+    auto& ht = gb.act_host_tiled;
+    uint32_t TW = TILE_WIDTH, TH = TILE_HEIGHT;
+    uint32_t num_tile_cols = gb.K_padded / TW;
+    for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
+        uint32_t tile_offset = tc * TH * TW;
+        // Face 0, row 0 (cols 0-15)
+        for (uint32_t j = 0; j < 16 && tc * TW + j < K; j++)
+            ht[tile_offset + j] = bfloat16(x[tc * TW + j]);
+        for (uint32_t j = K - tc * TW; j < 16; j++)
+            ht[tile_offset + j] = bfloat16(0.0f);
+        // Face 1, row 0 (cols 16-31)
+        for (uint32_t j = 0; j < 16 && tc * TW + 16 + j < K; j++)
+            ht[tile_offset + 256 + j] = bfloat16(x[tc * TW + 16 + j]);
+        for (uint32_t j = K - (tc * TW + 16); j < 16; j++)
+            if (tc * TW + 16 + j >= K) ht[tile_offset + 256 + j] = bfloat16(0.0f);
+    }
+    EnqueueWriteMeshBuffer(cq, gb.act_buf, ht, false);
 
-    // Read result back to host
-    auto vec = result.to_vector<float>();
-    uint32_t copy_len = std::min(M, (uint32_t)vec.size());
-    memcpy(y, vec.data(), copy_len * sizeof(float));
+    // 2. matmul: [1,1,1,K] × [1,1,M,K]^T = [1,1,1,M]
+    ttnn::matmul(gb.act_tensor, weight,
+                 /*transpose_a=*/false, /*transpose_b=*/true,
+                 /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
+                 /*dtype=*/std::nullopt,
+                 /*program_config=*/std::nullopt,
+                 /*activation=*/std::nullopt,
+                 /*compute_kernel_config=*/std::nullopt,
+                 /*core_grid=*/std::nullopt,
+                 /*output_tile=*/std::nullopt,
+                 /*optional_output_tensor=*/gb.out_tensor);
 
-    result.deallocate();
-    act.deallocate();
+    // 3. Read result and untilize
+    auto& oht = gb.out_host_tiled;
+    EnqueueReadMeshBuffer(cq, oht, gb.out_buf, true);
+
+    uint32_t out_tile_cols = gb.M_padded / TW;
+    for (uint32_t tc = 0; tc < out_tile_cols && tc * TW < M; tc++) {
+        uint32_t tile_offset = tc * TH * TW;
+        for (uint32_t j = 0; j < 16 && tc * TW + j < M; j++)
+            y[tc * TW + j] = static_cast<float>(oht[tile_offset + j]);
+        for (uint32_t j = 0; j < 16 && tc * TW + 16 + j < M; j++)
+            y[tc * TW + 16 + j] = static_cast<float>(oht[tile_offset + 256 + j]);
+    }
 }
 
 // ============================================================================
@@ -565,9 +658,6 @@ static std::vector<float> forward_decode() {
 
             attn_idx++;
         }
-
-        if (layer % 8 == 7)
-            printf("  [layer %d/%d done]\n", layer + 1, MC::n_layers);
     }
 
     // Final norm
@@ -744,6 +834,9 @@ const Tokenizer& get_tokenizer() {
 void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
+
+    // Clear pre-allocated GEMV buffers
+    g_gemv_bufs.clear();
 
     // Clear weight tensor wrappers — chip 0
     for (auto& t : g_wt.attn_wqkv) t = Tensor();
