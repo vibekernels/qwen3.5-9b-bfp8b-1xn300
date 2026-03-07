@@ -90,7 +90,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
         res.set_header("X-Accel-Buffering", "no");
 
         // Send initial role delta
-        res.set_chunked_content_provider("text/event-stream",
+        res.set_chunked_content_provider("text/event-stream; charset=utf-8",
             [&, prompt_tokens, max_tokens, temperature, model_name, completion_id, created]
             (size_t offset, httplib::DataSink& sink) -> bool {
 
@@ -217,12 +217,23 @@ header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2
 #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
 .msg { max-width: 780px; width: 100%; margin: 0 auto; display: flex; gap: 12px; }
 .msg.user { justify-content: flex-end; }
-.msg .bubble { padding: 10px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-width: 85%; font-size: 14px; }
-.msg.user .bubble { background: #1f6feb; color: #fff; border-bottom-right-radius: 4px; }
+.msg .bubble { padding: 10px 16px; border-radius: 12px; line-height: 1.5; word-break: break-word; max-width: 85%; font-size: 14px; }
+.msg.user .bubble { background: #1f6feb; color: #fff; border-bottom-right-radius: 4px; white-space: pre-wrap; }
 .msg.assistant .bubble { background: #161b22; border: 1px solid #30363d; border-bottom-left-radius: 4px; }
-.msg.assistant .bubble code { background: #0d1117; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+.msg.assistant .bubble code { background: #0d1117; padding: 1px 5px; border-radius: 4px; font-size: 13px; font-family: 'SF Mono', 'Menlo', 'Consolas', monospace; }
 .msg.assistant .bubble pre { background: #0d1117; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
 .msg.assistant .bubble pre code { background: none; padding: 0; }
+.msg.assistant .bubble p { margin: 0 0 8px; }
+.msg.assistant .bubble p:last-child { margin-bottom: 0; }
+.msg.assistant .bubble ul, .msg.assistant .bubble ol { margin: 4px 0 8px 20px; }
+.msg.assistant .bubble li { margin: 2px 0; }
+.msg.assistant .bubble h1, .msg.assistant .bubble h2, .msg.assistant .bubble h3 { margin: 12px 0 6px; font-size: 15px; }
+.msg.assistant .bubble h1 { font-size: 17px; }
+.msg.assistant .bubble blockquote { border-left: 3px solid #30363d; padding-left: 12px; color: #8b949e; margin: 8px 0; }
+.msg.assistant .bubble table { border-collapse: collapse; margin: 8px 0; }
+.msg.assistant .bubble th, .msg.assistant .bubble td { border: 1px solid #30363d; padding: 4px 8px; font-size: 13px; }
+.msg.assistant .bubble th { background: #161b22; }
+.msg.assistant .bubble hr { border: none; border-top: 1px solid #30363d; margin: 12px 0; }
 #input-area { padding: 12px 20px 20px; border-top: 1px solid #30363d; flex-shrink: 0; }
 #input-row { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; }
 #prompt { flex: 1; background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 10px 14px; border-radius: 8px; font-size: 14px; font-family: inherit; resize: none; outline: none; min-height: 44px; max-height: 200px; }
@@ -238,6 +249,7 @@ header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2
 #settings label { display: flex; align-items: center; gap: 4px; }
 #settings input, #settings select { background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 12px; width: 70px; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 </head>
 <body>
 <header>
@@ -270,12 +282,19 @@ function autoResize() {
 }
 prompt.addEventListener('input', autoResize);
 
+marked.setOptions({ breaks: true, gfm: true });
+
+function renderMarkdown(el, text) {
+  try { el.innerHTML = marked.parse(text); } catch { el.textContent = text; }
+}
+
 function addMessage(role, content) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = content;
+  if (role === 'user') bubble.textContent = content;
+  else renderMarkdown(bubble, content);
   div.appendChild(bubble);
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
@@ -309,7 +328,7 @@ async function send() {
     });
 
     const reader = res.body.getReader();
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder('utf-8');
     let buf = '';
 
     while (true) {
@@ -325,7 +344,7 @@ async function send() {
           const delta = obj.choices?.[0]?.delta;
           if (delta?.content) {
             fullText += delta.content;
-            bubble.textContent = fullText;
+            renderMarkdown(bubble, fullText);
             chat.scrollTop = chat.scrollHeight;
           }
         } catch {}
@@ -401,7 +420,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(CHAT_HTML, "text/html");
+        res.set_content(CHAT_HTML, "text/html; charset=utf-8");
     });
     svr.Post("/v1/chat/completions", handle_chat_completions);
     svr.Get("/v1/models", handle_models);

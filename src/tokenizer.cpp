@@ -292,33 +292,55 @@ std::vector<std::string> Tokenizer::bpe(const std::vector<std::string>& input_to
     return tokens;
 }
 
+// Build GPT-2 byte-level BPE reverse lookup: unicode codepoint → original byte.
+// GPT-2 maps 188 "printable" bytes (33-126, 161-172, 174-255) to their own codepoints,
+// and the remaining 68 bytes (0-32, 127-160, 173) to U+0100..U+0143 sequentially.
+static const unsigned char* get_unicode_to_byte() {
+    static unsigned char table[324] = {};
+    static bool init = false;
+    if (!init) {
+        for (int b = 33; b <= 126; b++) table[b] = (unsigned char)b;
+        for (int b = 161; b <= 172; b++) table[b] = (unsigned char)b;
+        for (int b = 174; b <= 255; b++) table[b] = (unsigned char)b;
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))
+                continue;
+            table[256 + n] = (unsigned char)b;
+            n++;
+        }
+        init = true;
+    }
+    return table;
+}
+
 std::string Tokenizer::decode(int token_id) const {
     if (token_id < 0 || token_id >= (int)id_to_token_.size()) return "";
     const std::string& tok = id_to_token_[token_id];
+    static const unsigned char* u2b = get_unicode_to_byte();
 
-    // Decode GPT-2 byte-level encoding back to UTF-8 bytes
+    // Decode GPT-2 byte-level encoding: each unicode codepoint in the token
+    // string maps back to a single byte via the GPT-2 bytes_to_unicode table.
     std::string result;
     size_t i = 0;
     while (i < tok.size()) {
         unsigned char c = tok[i];
-        if (c == 0xC4 && i + 1 < tok.size() && (unsigned char)tok[i + 1] == 0xA0) {
-            // Ġ -> space
-            result += ' ';
-            i += 2;
-        } else if (c >= 0xC4 && c <= 0xC5 && i + 1 < tok.size()) {
-            // Check if this is a byte-mapped char (U+0100 to U+01FF)
-            unsigned char c2 = tok[i + 1];
-            int cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
-            if (cp >= 0x100 && cp <= 0x1FF) {
-                result += (char)(cp - 0x100);
-                i += 2;
-            } else {
-                result += tok[i];
-                i++;
-            }
+        int cp, len;
+        if (c < 0x80) {
+            cp = c; len = 1;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < tok.size()) {
+            cp = ((c & 0x1F) << 6) | (tok[i + 1] & 0x3F); len = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < tok.size()) {
+            cp = ((c & 0x0F) << 12) | ((tok[i + 1] & 0x3F) << 6) | (tok[i + 2] & 0x3F); len = 3;
         } else {
-            result += tok[i];
-            i++;
+            result += tok[i]; i++; continue;
+        }
+        i += len;
+        if (cp < 324) {
+            result += (char)u2b[cp];
+        } else {
+            // Not in GPT-2 byte mapping — output original UTF-8 bytes
+            for (int j = len; j > 0; j--) result += tok[i - j];
         }
     }
     return result;
