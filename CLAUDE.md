@@ -1,31 +1,27 @@
 # Project structure
 
-- `src/engine.cu` — inference engine: CUDA kernels, forward pass, `generate()`, `load_model_and_tokenizer()`
-- `src/cli.cu` — CLI entry point (`qwen-inference`)
-- `src/server.cu` — HTTP server entry point (`qwen-server`)
-- `src/kernels/` — individual CUDA kernel files (attention, ffn, rmsnorm, rope, embedding, mamba)
-- `src/model.h` — model config and weight structs
-- `src/inference.h` — public API: `generate()`, `load_model_and_tokenizer()`, `reset_state()`, `get_tokenizer()`
+- `tt_metal/host/engine.cpp` — inference engine: forward pass, `generate()`, `load_model_and_tokenizer()`
+- `tt_metal/host/engine.h` — public API: `generate()`, `load_model_and_tokenizer()`, `reset_state()`, `shutdown()`, `get_tokenizer()`
+- `tt_metal/host/gguf_loader.{h,cpp}` — GGUF weight loading into device DRAM MeshBuffers
+- `tt_metal/host/model_config.h` — model hyperparameters and tile dimensions
+- `tt_metal/kernels/` — Tensix compute/dataflow kernels (currently unused, matmuls via ttnn API)
+- `tt_metal/tests/` — test suite (device, matmul, weight loading, forward pass)
+- `tt_metal/CMakeLists.txt` — CMake build system
 - `src/tokenizer.{h,cpp}` — BPE tokenizer (GPT-2 byte-level)
-- `src/sampling.{h,cu}` — token sampling (top-k, top-p, temperature)
 - `src/download.{h,cpp}` — HuggingFace model download
-- `tests/` — test suite
 
 ## Build & test
 
 ```sh
-make -j$(nproc)    # build CLI + server
-make test          # run all tests (CPU + GPU)
-make test-cpu      # UTF-8 streaming buffer + tokenizer tests
-make test-gpu      # inference integration tests (small + full context)
+cd tt_metal && mkdir -p build && cd build
+cmake .. -DTT_METAL_BUILD=/home/ubuntu/tt-metal/build_Release
+make -j$(nproc)
 ```
 
 ## Test inference
 
-Run a one-shot completion (non-interactive) with:
-
 ```sh
-./qwen-inference -m unsloth/Qwen3.5-9B-GGUF:BF16 -p "Your prompt here" -n 128
+./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "Your prompt here" 128
 ```
 
 ## Reference model (llama.cpp)
@@ -35,6 +31,3 @@ For comparison against llama.cpp:
 ```sh
 llama-completion -hf unsloth/Qwen3.5-9B-GGUF:BF16 -p "Your prompt here" -n 128 -ngl 99
 ```
-
-# currentDate
-Today's date is 2026-03-07.

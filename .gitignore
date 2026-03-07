@@ -1,15 +1,11 @@
 # Build artifacts
 build/
-qwen-inference
-qwen-server
-dump_ggml_hidden
+tt_metal/build/
 
 # Model data
 data/
-
-# CUDA
-*.o
-*.cubin
+models/
+*.gguf
 
 # Editor
 *.swp

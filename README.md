@@ -1,100 +1,87 @@
-# qwen3.5-9b-bf16-1x5090
+# qwen3.5-9b-bf16-1xn300d
 
-Custom CUDA inference engine for Qwen3.5-9B on a single RTX 5090, built from scratch with hand-written kernels (no frameworks).
+Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with hand-written tt-metal kernels (no frameworks).
 
-## RunPod (Docker)
+## Architecture
 
-Every push to `main` builds a Docker image at `ghcr.io/vibekernels/qwen3.5-9b-bf16-1x5090:latest`.
+Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (every 4th) and 24 SSM delta-net recurrent layers.
 
-Create a RunPod GPU pod with:
+- **Matrix multiplications** run on-device via `ttnn::matmul` on Tensix cores
+- **Chip 0** holds layer weights (attention QKV, SSM combined, FFN gate/up/down projections)
+- **Chip 1** holds output projections (attention Wo, SSM out, LM head)
+- **Small element-wise ops** (RoPE, attention scores, SSM recurrence, gating, RMSNorm) run on host CPU in f32
+- **Weights** stored on device DRAM as tiled BF16 MeshBuffers (~12 GB total)
 
-- **Container Image:** `ghcr.io/vibekernels/qwen3.5-9b-bf16-1x5090:latest`
-- **Container Disk:** 40 GB+ (for model weights)
-- **Expose HTTP Ports:** `8080`
-- **Expose TCP Ports:** `22` (for SSH)
+## Performance
 
-The container automatically downloads the model from HuggingFace and starts the server on port 8080. Set the `HF_MODEL` environment variable to override the default model (default: `unsloth/Qwen3.5-9B-GGUF:BF16`).
+| Metric | Value |
+|--------|-------|
+| Decode latency | ~290 ms/tok |
+| Decode throughput | ~3.4 tok/s |
+| Model size | ~18 GB BF16 |
 
-For SSH access, set the `PUBLIC_KEY` environment variable to your public key.
+Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM).
 
-## Building from source
+## Building
 
-Requires CUDA 12.8+ and an SM 12.0 GPU (RTX 5090).
+Requires tt-metal built from source (with `_ttnncpp.so`).
 
 ```sh
+cd tt_metal
+mkdir -p build && cd build
+cmake .. -DTT_METAL_BUILD=/path/to/tt-metal/build_Release
 make -j$(nproc)
 ```
 
-This produces two binaries: `qwen-inference` (CLI) and `qwen-server` (HTTP server).
+This produces test binaries: `test_device`, `test_matmul`, `test_load_weights`, `test_forward`.
 
-## Testing
-
-```sh
-make test          # run all tests
-make test-cpu      # UTF-8 streaming + tokenizer tests (no GPU needed, downloads model for tokenizer)
-make test-gpu      # inference integration tests (requires GPU, auto-downloads model)
-```
-
-GPU tests run at both small (4096) and full (262144) context sizes to exercise different attention kernels.
-
-### Performance thresholds
-
-| Context | Decode tok/s | Prefill tok/s |
-|---------|-------------|---------------|
-| 4096 (small) | ≥ 92 | ≥ 2000 |
-| 262144 (full) | ≥ 87 | ≥ 1500 |
-
-Override with env vars: `MIN_TOK_PER_SEC`, `MIN_PREFILL_TOK_PER_SEC`, `TEST_CTX_SIZE`, `MODEL_PATH`.
-
-## CLI (`qwen-inference`)
-
-One-shot text completion.
+## Running inference
 
 ```sh
-./qwen-inference -m unsloth/Qwen3.5-9B-GGUF:BF16 -p "The capital of France is" -n 128
+./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "What is the capital of France?" 128
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-m` | Model path or HuggingFace tag (e.g. `org/repo:quant`) | *required* |
-| `-p` | Prompt text | `Hello, world!` |
-| `-n` | Max tokens to generate | `128` |
-| `-t` | Temperature | `0.8` |
-| `--model-dir` | Local model cache directory | `~/.cache/qwen-models` |
+Pass `--raw` as a 4th argument to skip the chat template and send the prompt directly.
 
-## Server (`qwen-server`)
-
-OpenAI-compatible HTTP server with a built-in chat UI at `/`.
+## Tests
 
 ```sh
-./qwen-server -m unsloth/Qwen3.5-9B-GGUF:BF16
+./build/test_device        # validate N300 device opens correctly
+./build/test_matmul        # basic ttnn::matmul on device
+./build/test_load_weights  # load GGUF weights into device DRAM
+./build/test_forward       # full generation test
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-m` | Model path or HuggingFace tag (e.g. `org/repo:quant`) | *required* |
-| `--host` | Listen address | `0.0.0.0` |
-| `--port` | Listen port | `8080` |
-| `--ctx-size` | Max context length | `262144` |
-| `--model-dir` | Local model cache directory | `~/.cache/qwen-models` |
+## Project structure
 
-### API endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Chat UI (web browser) |
-| `/v1/chat/completions` | POST | OpenAI-compatible chat completions |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check |
-| `/api/status` | GET | Download/loading progress |
-
-### Example request
-
-```sh
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "What is the capital of France?"}],
-    "temperature": 0.7
-  }'
 ```
+tt_metal/
+  CMakeLists.txt              # build system
+  host/
+    engine.cpp                # inference engine (forward pass, generate loop)
+    engine.h                  # public API: load_model_and_tokenizer(), generate(), etc.
+    gguf_loader.cpp           # GGUF weight loading into device DRAM MeshBuffers
+    gguf_loader.h             # loader interface
+    model_config.h            # Qwen3.5-9B hyperparameters and tile dimensions
+  kernels/
+    compute/                  # Tensix compute kernels (unused — matmuls via ttnn)
+    dataflow/                 # data movement kernels (unused — using ttnn API)
+  tests/
+    test_device.cpp           # device validation
+    test_matmul.cpp           # basic matmul test
+    test_load_weights.cpp     # weight loading test
+    test_forward.cpp          # end-to-end generation test
+src/
+  tokenizer.{h,cpp}          # BPE tokenizer (GPT-2 byte-level)
+  download.{h,cpp}           # HuggingFace model download
+```
+
+## Key optimizations
+
+- **Pre-allocated device buffers** for zero-allocation GEMV dispatch (no per-call MeshBuffer create/destroy)
+- **Two-chip parallelism**: layer weights on chip 0, output projections on chip 1
+- **Pre-computed RoPE tables** (avoids trig calls per token)
+- **Raw bf16 bit operations** for f32<->bf16 conversion (avoids bfloat16 class overhead)
+- **Static scratch buffers** for all forward pass intermediates (no heap allocation per token)
+- **Transposed SSM state layout** `[head_v, head_k]` for contiguous inner-loop access
+- **Program cache enabled** for faster repeated matmul dispatch
