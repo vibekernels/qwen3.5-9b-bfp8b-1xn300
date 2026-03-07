@@ -127,35 +127,29 @@ bool Tokenizer::load(const std::string& gguf_path) {
 }
 
 // GPT-2 byte-to-unicode mapping
-// Bytes 33-126, 161-172, 174-255 map to themselves (as unicode)
-// Other bytes (0-32, 127-160, 173) map to U+0100 + sequential offset
-static std::string byte_to_unicode(unsigned char b) {
-    // Printable ranges that map to themselves
-    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
-        return std::string(1, (char)b);
-    }
-    // Non-printable bytes map to U+0100+ range
-    // Build the mapping: iterate through 0-255, count non-printable bytes
+// Bytes 33-126, 161-172, 174-255 map to their own unicode codepoints.
+// Other bytes (0-32, 127-160, 173) map to U+0100 + sequential offset.
+// All codepoints are encoded as UTF-8 strings for token lookup.
+static const std::string& byte_to_unicode(unsigned char b) {
     static std::string table[256];
     static bool initialized = false;
     if (!initialized) {
+        auto encode_cp = [](int cp) -> std::string {
+            if (cp < 0x80) {
+                return std::string(1, (char)cp);
+            } else if (cp < 0x800) {
+                char utf8[3] = { (char)(0xC0 | (cp >> 6)), (char)(0x80 | (cp & 0x3F)), 0 };
+                return std::string(utf8);
+            }
+            return "";
+        };
         int offset = 0;
         for (int i = 0; i < 256; i++) {
             if ((i >= 33 && i <= 126) || (i >= 161 && i <= 172) || (i >= 174)) {
-                table[i] = std::string(1, (char)i);
+                table[i] = encode_cp(i);  // codepoint == byte value, but encode as UTF-8
             } else {
-                int cp = 256 + offset;
+                table[i] = encode_cp(256 + offset);
                 offset++;
-                // Encode code point as UTF-8
-                if (cp < 0x80) {
-                    table[i] = std::string(1, (char)cp);
-                } else if (cp < 0x800) {
-                    char utf8[3];
-                    utf8[0] = (char)(0xC0 | (cp >> 6));
-                    utf8[1] = (char)(0x80 | (cp & 0x3F));
-                    utf8[2] = 0;
-                    table[i] = std::string(utf8);
-                }
             }
         }
         initialized = true;

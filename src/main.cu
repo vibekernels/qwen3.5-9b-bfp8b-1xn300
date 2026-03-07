@@ -1132,8 +1132,14 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     // Decode loop
     int generated = 0;
     StopReason reason = STOP_LENGTH;
+    std::string utf8_buf;  // buffer for incomplete UTF-8 sequences across tokens
     for (int i = 0; i < max_tokens; i++) {
         if (next_token == g_tokenizer.eos_token_id()) {
+            // Flush any remaining buffered bytes before stopping
+            if (cb && !utf8_buf.empty()) {
+                cb(next_token, utf8_buf);
+                utf8_buf.clear();
+            }
             reason = STOP_EOS;
             break;
         }
@@ -1142,10 +1148,31 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         g_cached_tokens.push_back(next_token);
 
         if (cb) {
-            std::string tok_str = g_tokenizer.decode(next_token);
-            if (!cb(next_token, tok_str)) {
-                reason = STOP_CALLBACK;
-                break;
+            utf8_buf += g_tokenizer.decode(next_token);
+            // Check if buffer ends with a complete UTF-8 sequence
+            // UTF-8 leading byte tells expected length: 0xxxxxxx=1, 110xxxxx=2, 1110xxxx=3, 11110xxx=4
+            // Continuation bytes: 10xxxxxx
+            bool complete = true;
+            if (!utf8_buf.empty()) {
+                // Scan backwards to find the last leading byte
+                int pos = (int)utf8_buf.size() - 1;
+                while (pos >= 0 && ((unsigned char)utf8_buf[pos] & 0xC0) == 0x80) pos--;
+                if (pos >= 0) {
+                    unsigned char lead = utf8_buf[pos];
+                    int expected = 1;
+                    if ((lead & 0xE0) == 0xC0) expected = 2;
+                    else if ((lead & 0xF0) == 0xE0) expected = 3;
+                    else if ((lead & 0xF8) == 0xF0) expected = 4;
+                    int have = (int)utf8_buf.size() - pos;
+                    complete = (have >= expected);
+                }
+            }
+            if (complete) {
+                if (!cb(next_token, utf8_buf)) {
+                    reason = STOP_CALLBACK;
+                    break;
+                }
+                utf8_buf.clear();
             }
         }
 
