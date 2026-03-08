@@ -648,124 +648,31 @@ static void dispatch_gemv_resadd(MeshDevice* device,
     }
 }
 
-// Cached SwiGLU workload: SiLU(gate) * up
-struct CachedSwigluWorkload {
-    MeshWorkload workload;
-    bool valid = false;
-};
-static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedSwigluWorkload> g_swiglu_cache;
-
-// Dispatch SwiGLU: out = SiLU(gate) * up
-// gate_buf, up_buf: [1, N_padded] BF16 on device
-// out_buf: [1, N_padded] BF16 on device
-static void dispatch_swiglu(MeshDevice* device,
-                             std::shared_ptr<MeshBuffer> gate_buf,
-                             std::shared_ptr<MeshBuffer> up_buf,
-                             std::shared_ptr<MeshBuffer> out_buf,
-                             uint32_t n_tiles) {
-    auto& cq = device->mesh_command_queue();
-    auto key = std::make_tuple((uint32_t)gate_buf->address(),
-                               (uint32_t)up_buf->address(), (uint32_t)out_buf->address());
-    auto& cached = g_swiglu_cache[key];
-
-    if (!cached.valid) {
-        MeshCoordinateRange dev_range(device->shape());
-        Program program = CreateProgram();
-        tt::tt_metal::CoreCoord core = {0, 0};
-
-        uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
-
-        // gate CB (c_0), up CB (c_1), intermediate SiLU CB (c_2), output CB (c_16)
-        CircularBufferConfig cb_gate_cfg =
-            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
-                .set_page_size(CBIndex::c_0, tile_bytes);
-        CreateCircularBuffer(program, core, cb_gate_cfg);
-
-        CircularBufferConfig cb_up_cfg =
-            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
-                .set_page_size(CBIndex::c_1, tile_bytes);
-        CreateCircularBuffer(program, core, cb_up_cfg);
-
-        CircularBufferConfig cb_silu_cfg =
-            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
-                .set_page_size(CBIndex::c_2, tile_bytes);
-        CreateCircularBuffer(program, core, cb_silu_cfg);
-
-        CircularBufferConfig cb_out_cfg =
-            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
-                .set_page_size(CBIndex::c_16, tile_bytes);
-        CreateCircularBuffer(program, core, cb_out_cfg);
-
-        // Reader: reads gate and up tiles into c_0 and c_1
-        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1};
-        TensorAccessorArgs(*gate_buf).append_to(reader_ct_args);
-        TensorAccessorArgs(*up_buf).append_to(reader_ct_args);
-
-        auto reader_kid = CreateKernel(program,
-            kernel_path("dataflow/reader_binary_tiles.cpp"), core,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
-                               .noc = NOC::RISCV_1_default,
-                               .compile_args = reader_ct_args});
-
-        SetRuntimeArgs(program, reader_kid, core,
-                       {(uint32_t)gate_buf->address(), (uint32_t)up_buf->address(), n_tiles});
-
-        // Compute: SwiGLU (SiLU(gate) * up)
-        std::vector<uint32_t> compute_ct_args = {n_tiles};
-        CreateKernel(program,
-            kernel_path("compute/swiglu.cpp"), core,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
-
-        // Writer: writes result from c_16
-        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
-        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
-
-        auto writer_kid = CreateKernel(program,
-            kernel_path("dataflow/writer_tiles.cpp"), core,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
-                               .noc = NOC::RISCV_0_default,
-                               .compile_args = writer_ct_args});
-
-        SetRuntimeArgs(program, writer_kid, core,
-                       {(uint32_t)out_buf->address(), n_tiles});
-
-        cached.workload = MeshWorkload();
-        cached.workload.add_program(dev_range, std::move(program));
-        EnqueueMeshWorkload(cq, cached.workload, false);
-        cached.valid = true;
-    } else {
-        EnqueueMeshWorkload(cq, cached.workload, false);
-    }
-}
-
-// Cached RMSNorm workload: created once, reused across calls (trace-compatible).
-struct CachedRmsnormWorkload {
-    MeshWorkload workload;
-    bool valid = false;
-};
-static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedRmsnormWorkload> g_rmsnorm_cache;
-
-// Cached fused norm+GEMV workload: single program with rmsnorm + GEMV on 12 cores.
+// Cached GEMV with fused RMSNorm: each reader core independently computes full rmsnorm
+// before doing GEMV weight reads. Eliminates host PCIe round-trip for rmsnorm.
 struct CachedFusedNormGemvWorkload {
     MeshWorkload workload;
     bool valid = false;
 };
-static std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t>, CachedFusedNormGemvWorkload> g_fused_norm_gemv_cache;
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>, CachedFusedNormGemvWorkload> g_fused_norm_gemv_cache;
 
-// Fused norm+GEMV: computes RMSNorm(hidden) on each core, then GEMV with sharded weights.
-// Eliminates separate rmsnorm program and intermediate norm buffer.
-static void dispatch_fused_norm_gemv(MeshDevice* device,
+// GEMV with fused RMSNorm: y[1,M] = rmsnorm(hidden, norm_weight) @ W[M,K]^T
+// hidden_buf: [1, K_padded] BF16 on device (will be rmsnorm'd by each reader core)
+// norm_weight_buf: [1, K_padded] BF16 on device (rmsnorm weights)
+// weight_buf: DRAM-sharded weight matrix
+// out_buf: [1, M_padded] BF16 output
+static void dispatch_gemv_fused_norm(MeshDevice* device,
                                       std::shared_ptr<MeshBuffer> hidden_buf,
                                       std::shared_ptr<MeshBuffer> norm_weight_buf,
                                       std::shared_ptr<MeshBuffer> weight_buf,
                                       std::shared_ptr<MeshBuffer> out_buf,
-                                      uint32_t M, uint32_t K,
+                                      uint32_t M, uint32_t K, uint32_t n_elements,
                                       tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
     auto& cq = device->mesh_command_queue();
     auto key = std::make_tuple((uint32_t)hidden_buf->address(),
                                (uint32_t)norm_weight_buf->address(),
                                (uint32_t)weight_buf->address(),
-                               (uint32_t)out_buf->address());
+                               (uint32_t)out_buf->address(), M);
     auto& cached = g_fused_norm_gemv_cache[key];
 
     if (!cached.valid) {
@@ -791,34 +698,34 @@ static void dispatch_fused_norm_gemv(MeshDevice* device,
         uint32_t effective_block = 16;
         uint32_t weight_cb_tiles = effective_block * 2;
 
-        // CB c_0: activation tiles (all Kt, holds normalized result)
+        // Activation CB (c_0): Kt tiles for hidden + normalized activations
         CircularBufferConfig cb_act_cfg =
             CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_0, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_act_cfg);
 
-        // CB c_1: weight tiles (double-buffered BLOCK)
+        // Weight CB (c_1): double-buffered weight reads
         CircularBufferConfig cb_weight_cfg =
             CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
                 .set_page_size(CBIndex::c_1, weight_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_weight_cfg);
 
-        // CB c_2: norm weight tiles (all Kt, temporary)
+        // Norm weight CB (c_2): Kt tiles for rmsnorm weights
         CircularBufferConfig cb_norm_cfg =
             CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_2, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_norm_cfg);
 
-        // CB c_16: output tiles
+        // Output CB (c_16): 2 tiles
         CircularBufferConfig cb_out_cfg =
             CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
                 .set_page_size(CBIndex::c_16, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_out_cfg);
 
-        // Fused reader: rmsnorm + weight reads
+        // Reader: fused rmsnorm + GEMV reader
         std::vector<uint32_t> reader_ct_args = {
-            (uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1,
-            (uint32_t)CBIndex::c_2, Kt, effective_block
+            (uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, (uint32_t)CBIndex::c_2,
+            Kt, effective_block
         };
         TensorAccessorArgs(*hidden_buf).append_to(reader_ct_args);
         TensorAccessorArgs(*norm_weight_buf).append_to(reader_ct_args);
@@ -829,13 +736,13 @@ static void dispatch_fused_norm_gemv(MeshDevice* device,
                                .noc = NOC::RISCV_1_default,
                                .compile_args = reader_ct_args});
 
-        // Compute kernel: same GEMV compute (Kt, BLOCK)
+        // Compute: same as regular GEMV
         std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/gemv.cpp"), all_cores,
             ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
 
-        // Writer kernel: same multi-core writer
+        // Writer: standard output writer
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
         TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
 
@@ -845,21 +752,18 @@ static void dispatch_fused_norm_gemv(MeshDevice* device,
                                .noc = NOC::RISCV_0_default,
                                .compile_args = writer_ct_args});
 
-        // Set per-core runtime args
         for (uint32_t b = 0; b < num_banks; b++) {
             CoreCoord core = g_dram_workers[b];
             uint32_t start_row = b * Mt_per_bank;
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
+            // Reader: [hidden_addr, norm_weight_addr, weight_bank_addr, Mt_per_core, bank_id, n_elements]
             SetRuntimeArgs(program, reader_kid, core,
-                           {(uint32_t)hidden_buf->address(),
-                            (uint32_t)norm_weight_buf->address(),
-                            (uint32_t)weight_buf->address(),
-                            mt_this_core, b, K});
+                           {(uint32_t)hidden_buf->address(), (uint32_t)norm_weight_buf->address(),
+                            (uint32_t)weight_buf->address(), mt_this_core, b, n_elements});
 
-            SetRuntimeArgs(program, compute_kid, core,
-                           {mt_this_core});
+            SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
 
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)out_buf->address(), mt_this_core, start_row});
@@ -873,6 +777,118 @@ static void dispatch_fused_norm_gemv(MeshDevice* device,
         EnqueueMeshWorkload(cq, cached.workload, false);
     }
 }
+
+// Cached SwiGLU workload: SiLU(gate) * up
+struct CachedSwigluWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedSwigluWorkload> g_swiglu_cache;
+
+// Dispatch SwiGLU (multi-core): out = SiLU(gate) * up
+// Uses 12 DRAM worker cores, each handling a slice of tiles.
+static void dispatch_swiglu(MeshDevice* device,
+                             std::shared_ptr<MeshBuffer> gate_buf,
+                             std::shared_ptr<MeshBuffer> up_buf,
+                             std::shared_ptr<MeshBuffer> out_buf,
+                             uint32_t n_tiles) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)gate_buf->address(),
+                               (uint32_t)up_buf->address(), (uint32_t)out_buf->address());
+    auto& cached = g_swiglu_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+        Program program = CreateProgram();
+
+        uint32_t num_banks = g_num_dram_banks;
+        uint32_t tiles_per_bank = (n_tiles + num_banks - 1) / num_banks;
+
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = g_dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
+
+        uint32_t tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+        // gate CB (c_0), up CB (c_1), intermediate SiLU CB (c_2), output CB (c_16)
+        CircularBufferConfig cb_gate_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_gate_cfg);
+
+        CircularBufferConfig cb_up_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_1, tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_up_cfg);
+
+        CircularBufferConfig cb_silu_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_silu_cfg);
+
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
+
+        // Reader: reads gate and up tiles with start offset
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1};
+        TensorAccessorArgs(*gate_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*up_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_binary_tiles_multicore.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute: SwiGLU with runtime num_tiles
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/swiglu_multicore.cpp"), all_cores,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4});
+
+        // Writer: writes output tiles with start offset
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_multicore.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = g_dram_workers[b];
+            uint32_t start_tile = b * tiles_per_bank;
+            uint32_t my_tiles = (start_tile >= n_tiles) ? 0 :
+                                std::min(tiles_per_bank, n_tiles - start_tile);
+
+            SetRuntimeArgs(program, reader_kid, core,
+                           {(uint32_t)gate_buf->address(), (uint32_t)up_buf->address(),
+                            my_tiles, start_tile});
+            SetRuntimeArgs(program, compute_kid, core, {my_tiles});
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)out_buf->address(), my_tiles, start_tile});
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached RMSNorm workload: created once, reused across calls (trace-compatible).
+struct CachedRmsnormWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedRmsnormWorkload> g_rmsnorm_cache;
 
 // Dispatch custom RMSNorm: out = rms_norm(input) * weight
 // All buffers are [1, n_embd_padded] BF16 on device.
@@ -1731,9 +1747,9 @@ static float* forward_decode() {
         // Test 3: Time 10x (fused norm+GEMV + Finish)
         auto te = Clock::now();
         for (int r = 0; r < 10; r++) {
-            dispatch_fused_norm_gemv(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+            dispatch_gemv_fused_norm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
                                      g_wt.ssm_w_combined_buf[0], gb_test.out_buf,
-                                     g_combined_rows, MC::n_embd);
+                                     g_combined_rows, MC::n_embd, MC::n_embd);
             Finish(cq0);
         }
         auto tf = Clock::now();
@@ -1861,7 +1877,7 @@ static float* forward_decode() {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
-            // 1. Host rmsnorm + combined GEMV on device (eliminates 1.9ms device rmsnorm)
+            // 1. Host rmsnorm + combined GEMV on device
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
             auto t0 = Clock::now();
 
@@ -1869,12 +1885,12 @@ static float* forward_decode() {
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
-            // Host rmsnorm (~0.03ms vs 1.9ms on device)
+            // Host rmsnorm (~0.03ms vs slow software float on RISC-V)
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
 
-            // GEMV only (~0.4ms)
+            // GEMV only
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
                           gb_comb.out_buf, g_combined_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
@@ -2049,7 +2065,7 @@ static float* forward_decode() {
             auto& lw = g_model.attn_layers[attn_idx];
             auto& aw = g_attn_small[attn_idx];
 
-            // 1. Host rmsnorm + QKV GEMV on device (eliminates 1.9ms device rmsnorm)
+            // 1. Host rmsnorm + QKV GEMV on device
             auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
             auto t0 = Clock::now();
 
@@ -2057,12 +2073,12 @@ static float* forward_decode() {
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
-            // Host rmsnorm (~0.03ms vs 1.9ms on device)
+            // Host rmsnorm
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
 
-            // QKV GEMV only (~0.4ms)
+            // QKV GEMV
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
                           gb_qkv.out_buf, g_qkv_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
@@ -2179,7 +2195,7 @@ static float* forward_decode() {
         }
     }
 
-    // Output norm (host) + LM head GEMV (device)
+    // Output norm (host) + LM head GEMV (device, traced)
     auto t_lm = Clock::now();
     auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
 
