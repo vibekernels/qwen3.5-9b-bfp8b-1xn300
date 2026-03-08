@@ -45,8 +45,7 @@ target_include_directories(qwen_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/host $
 target_compile_options(qwen_engine PRIVATE -march=native -ffast-math)
 target_compile_definitions(qwen_engine PRIVATE KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
 
-# Link ttnn C++ library for device-side ops (matmul, rmsnorm, etc.)
-target_link_libraries(qwen_engine PUBLIC ${TT_METAL_BUILD}/lib/_ttnncpp.so)
+# Additional include paths from tt-metal build
 target_include_directories(qwen_engine PUBLIC ${TT_METAL_BUILD}/include)
 
 # Test: forward pass (single token through all layers)
@@ -55,7 +54,7 @@ target_link_libraries(test_forward PRIVATE qwen_engine)
 
 # Bandwidth benchmark
 add_executable(test_bandwidth /tmp/test_bandwidth2.cpp)
-target_link_libraries(test_bandwidth PRIVATE TT::Metalium ${TT_METAL_BUILD}/lib/_ttnncpp.so)
+target_link_libraries(test_bandwidth PRIVATE TT::Metalium)
 target_include_directories(test_bandwidth PRIVATE ${TT_METAL_BUILD}/include)
 
 # Mesh overhead benchmark

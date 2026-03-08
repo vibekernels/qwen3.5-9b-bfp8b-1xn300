@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Qwen3.5-9B inference engine for Tenstorrent N300 via tt-metal.
 //
-// Matrix multiplications run on-device via ttnn::matmul on Tensix cores.
+// All matmuls run on-device via custom DRAM-sharded GEMV kernels on Tensix cores.
 // Small element-wise ops (RoPE, gating, SSM recurrence) remain on host CPU.
-
-// ttnn headers FIRST (they pull in tt-metalium internally with correct include order)
-#include <ttnn/tensor/tensor.hpp>
-#include <ttnn/tensor/types.hpp>
-#include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-
-#include <ttnn/types.hpp>
+// No ttnn dependency — uses only tt-metalium APIs.
 
 #include "engine.h"
 #include "model_config.h"
@@ -83,9 +76,9 @@ static constexpr int conv_state_len = MC::ssm_conv_kernel - 1;  // 3
 static std::vector<float> g_conv_state[24];
 
 // ============================================================================
-// Cached weight Tensors (wrapping on-device MeshBuffers for ttnn::matmul)
+// Cached weight MeshBuffers (on-device, DRAM-sharded BFP8_B tiles)
 // ============================================================================
-struct WeightTensors {
+struct WeightBuffers {
     // Chip 0: Attention layers (8) — MeshBuffers for custom kernel dispatch
     std::shared_ptr<MeshBuffer> attn_wqkv_buf[8];
     std::shared_ptr<MeshBuffer> attn_ffn_gate_buf[8];
@@ -108,54 +101,24 @@ struct WeightTensors {
     std::shared_ptr<MeshBuffer> post_norm_buf[32];
     std::shared_ptr<MeshBuffer> output_norm_buf;
 
-    // Keep Tensor wrappers temporarily for compatibility during transition
-    Tensor attn_wqkv[8];
-    Tensor attn_ffn_gate[8];
-    Tensor attn_ffn_up[8];
-    Tensor attn_ffn_down[8];
-    Tensor ssm_w_combined[24];
-    Tensor ssm_ffn_gate[24];
-    Tensor ssm_ffn_up[24];
-    Tensor ssm_ffn_down[24];
-    Tensor attn_wo[8];
-    Tensor ssm_out[24];
-    Tensor lm_head;
-    Tensor attn_norm[32];
-    Tensor post_norm[32];
-    Tensor output_norm_tensor;
 };
-static WeightTensors g_wt;
+static WeightBuffers g_wt;
 
 // Persistent hidden state on device (avoids PCIe round-trips between layers)
 static std::shared_ptr<MeshBuffer> g_hidden_dev_buf;
-static Tensor g_hidden_dev;
 static std::shared_ptr<MeshBuffer> g_residual_dev_buf;
-static Tensor g_residual_dev;
 // Temp buffer for matmul input after rms_norm (on device)
 static std::shared_ptr<MeshBuffer> g_norm_dev_buf;
-static Tensor g_norm_dev;
-
-// Wrap an existing on-device MeshBuffer as a ttnn Tensor for use with ttnn::matmul
-static Tensor wrap_weight(std::shared_ptr<MeshBuffer> buf, uint32_t M, uint32_t K) {
-    DeviceStorage storage(buf, {MeshCoordinate(0, 0)});
-    TensorSpec spec(
-        Shape({1, 1, M, K}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    TensorTopology topology;
-    return Tensor(std::move(storage), spec, topology);
-}
 
 // ============================================================================
 // Pre-allocated device buffers for fast GEMV (avoids per-call alloc/dealloc)
 // ============================================================================
 struct GemvBuf {
     std::shared_ptr<MeshBuffer> act_buf;    // device-side activation buffer
-    Tensor act_tensor;                       // wraps act_buf
     std::vector<bfloat16> act_host_tiled;   // pre-allocated host tilized buffer
     uint32_t K_padded;
 
     std::shared_ptr<MeshBuffer> out_buf;    // device-side output buffer
-    Tensor out_tensor;                       // wraps out_buf
     std::vector<bfloat16> out_host_tiled;   // pre-allocated host read buffer
     uint32_t M_padded;
 };
@@ -188,23 +151,9 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
                                       dram_cfg, device);
     buf.act_host_tiled.resize(act_tiles * TH * TW, bfloat16(0.0f));
 
-    // Wrap as Tensor
-    TensorSpec act_spec(
-        Shape({1, 1, 1, buf.K_padded}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    buf.act_tensor = Tensor(DeviceStorage(buf.act_buf, {MeshCoordinate(0, 0)}),
-                            act_spec, TensorTopology{});
-
-    // Output buffer
     buf.out_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = out_tiles * tile_bytes},
                                       dram_cfg, device);
     buf.out_host_tiled.resize(out_tiles * TH * TW, bfloat16(0.0f));
-
-    TensorSpec out_spec(
-        Shape({1, 1, 1, buf.M_padded}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    buf.out_tensor = Tensor(DeviceStorage(buf.out_buf, {MeshCoordinate(0, 0)}),
-                            out_spec, TensorTopology{});
 
     auto [ins, _] = g_gemv_bufs.emplace(key, std::move(buf));
     printf("  [gemv_buf] allocated K=%u M=%u on device\n", K, M); fflush(stdout);
@@ -230,94 +179,6 @@ static inline float bf16_to_f32(uint16_t b) {
 // ============================================================================
 // Pre-allocated bf16 scratch for bulk conversion (max possible K or M)
 static std::vector<uint16_t> g_bf16_scratch(MC::n_vocab_padded);
-
-// Per-matmul trace storage: indexed by a sequential ID per unique weight
-struct GemvTrace {
-    MeshTraceId trace_id;
-    bool valid = false;
-};
-static GemvTrace g_gemv_traces[128];  // max 65 unique matmuls + headroom
-
-// Detailed timing counters for device_gemv sub-operations
-static double g_t_tilize = 0, g_t_enqueue = 0, g_t_dispatch = 0, g_t_read = 0, g_t_host = 0;
-static int g_gemv_count = 0;
-
-static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, uint32_t K,
-                        const float* x, float* y, int trace_idx = -1) {
-    using Clock = std::chrono::high_resolution_clock;
-    auto& gb = get_gemv_buf(device, M, K);
-    auto& cq = device->mesh_command_queue();
-
-    // 1. Host-side tilize + PCIe write
-    auto t0 = Clock::now();
-    uint16_t* scratch = g_bf16_scratch.data();
-    const uint32_t* xbits = reinterpret_cast<const uint32_t*>(x);
-    for (uint32_t i = 0; i < K; i++)
-        scratch[i] = static_cast<uint16_t>(xbits[i] >> 16);
-
-    uint16_t* ht = reinterpret_cast<uint16_t*>(gb.act_host_tiled.data());
-    uint32_t num_tile_cols = gb.K_padded / TILE_WIDTH;
-    for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
-        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
-        uint32_t base = tc * TILE_WIDTH;
-        memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
-        memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
-    }
-    auto t0b = Clock::now();
-    EnqueueWriteMeshBuffer(cq, gb.act_buf, gb.act_host_tiled, false);
-    auto t1 = Clock::now();
-
-    // 2. matmul dispatch (with optional trace)
-    auto do_matmul = [&]() {
-        ttnn::matmul(gb.act_tensor, weight,
-                     false, true, ttnn::DRAM_MEMORY_CONFIG,
-                     std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-                     std::nullopt, std::nullopt, gb.out_tensor);
-    };
-
-    if (trace_idx >= 0 && trace_idx < 128) {
-        auto& tr = g_gemv_traces[trace_idx];
-        if (!tr.valid) {
-            do_matmul();
-            EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
-            auto tid = device->begin_mesh_trace(0);
-            do_matmul();
-            device->end_mesh_trace(0, tid);
-            tr.trace_id = tid;
-            tr.valid = true;
-        } else {
-            device->replay_mesh_trace(0, tr.trace_id, false);
-        }
-    } else {
-        do_matmul();
-    }
-    auto t2 = Clock::now();
-
-    // 3. Blocking read (waits for device compute + PCIe DMA)
-    EnqueueReadMeshBuffer(cq, gb.out_host_tiled, gb.out_buf, true);
-    auto t3 = Clock::now();
-
-    // 4. Host-side untilize + convert
-    const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
-    uint32_t out_tile_cols = gb.M_padded / TILE_WIDTH;
-    for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
-        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
-        uint32_t base = tc * TILE_WIDTH;
-        memcpy(scratch + base, oht + tile_off, 16 * sizeof(uint16_t));
-        memcpy(scratch + base + 16, oht + tile_off + 256, 16 * sizeof(uint16_t));
-    }
-    uint32_t* ybits = reinterpret_cast<uint32_t*>(y);
-    for (uint32_t i = 0; i < M; i++)
-        ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
-    auto t4 = Clock::now();
-
-    g_t_tilize += std::chrono::duration<double, std::milli>(t0b - t0).count();
-    g_t_enqueue += std::chrono::duration<double, std::milli>(t1 - t0b).count();
-    g_t_dispatch += std::chrono::duration<double, std::milli>(t2 - t1).count();
-    g_t_read += std::chrono::duration<double, std::milli>(t3 - t2).count();
-    g_t_host += std::chrono::duration<double, std::milli>(t4 - t3).count();
-    g_gemv_count++;
-}
 
 // ============================================================================
 // Custom tt-metal kernel dispatch (replaces ttnn ops)
@@ -1079,11 +940,8 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
 struct FfnBuf {
     // Intermediates for gate/up split + SiLU + multiply
     std::shared_ptr<MeshBuffer> gate_buf;   // [1, n_ff] tiled
-    Tensor gate_tensor;
     std::shared_ptr<MeshBuffer> up_buf;     // [1, n_ff] tiled
-    Tensor up_tensor;
     std::shared_ptr<MeshBuffer> act_buf;    // [1, n_ff] tiled (silu result / multiply result)
-    Tensor act_tensor;
     bool initialized = false;
 };
 static std::map<MeshDevice*, FfnBuf> g_ffn_bufs;
@@ -1105,17 +963,6 @@ static FfnBuf& get_ffn_buf(MeshDevice* device) {
                                      dram_cfg, device);
     buf.act_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = n_ff_tiles * tile_bytes},
                                       dram_cfg, device);
-
-    TensorSpec half_spec(
-        Shape({1, 1, 1, n_ff_padded}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-
-    buf.gate_tensor = Tensor(DeviceStorage(buf.gate_buf, {MeshCoordinate(0, 0)}),
-                              half_spec, TensorTopology{});
-    buf.up_tensor = Tensor(DeviceStorage(buf.up_buf, {MeshCoordinate(0, 0)}),
-                            half_spec, TensorTopology{});
-    buf.act_tensor = Tensor(DeviceStorage(buf.act_buf, {MeshCoordinate(0, 0)}),
-                             half_spec, TensorTopology{});
     buf.initialized = true;
 
     auto [ins, _] = g_ffn_bufs.emplace(device, std::move(buf));
@@ -1338,7 +1185,6 @@ static std::vector<uint32_t> pack_bf16_as_bfp8b(const uint16_t* bf16_data, uint3
     return pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(span, /*row_major_input=*/true, /*is_exp_a=*/false);
 }
 
-// Upload pre-packed BFP8_B tiles to device and wrap as Tensor
 // Upload packed BFP8_B data to device, return MeshBuffer directly
 static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
                                                             const std::vector<uint32_t>& packed,
@@ -1394,23 +1240,7 @@ static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
     return buf;
 }
 
-static Tensor upload_packed_bfp8b(MeshDevice* device, const std::vector<uint32_t>& packed,
-                                   uint32_t M, uint32_t K) {
-    auto buf = upload_packed_bfp8b_buf(device, packed, M, K);
-    TensorSpec spec(
-        Shape({1, 1, M, K}),
-        TensorLayout(DataType::BFLOAT8_B, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    return Tensor(DeviceStorage(buf, {MeshCoordinate(0, 0)}), spec, TensorTopology{});
-}
-
-// Upload host bf16 data to a device as a weight Tensor [M, K] in BFP8_B tiled layout
-static Tensor upload_bf16_weight(MeshDevice* device, const uint16_t* bf16_data,
-                                  uint32_t M, uint32_t K) {
-    auto packed = pack_bf16_as_bfp8b(bf16_data, M, K);
-    return upload_packed_bfp8b(device, packed, M, K);
-}
-
-// Create Tensor wrappers — pack weights as BFP8_B (multi-threaded) then upload.
+// Create weight buffers — pack weights as BFP8_B (multi-threaded) then upload.
 // Each weight's host bf16 is freed immediately after packing to minimize peak memory.
 static void create_weight_tensors() {
     printf("Packing and uploading weights as BFLOAT8_B (multi-threaded)...\n");
@@ -1498,30 +1328,17 @@ static void create_weight_tensors() {
     g_lm_head_buf = g_wt.lm_head_buf;
     printf("  lm_head uploaded\n");
 
-    // Wrap norm weights as device Tensors for on-device RMSNorm
-    printf("Creating norm weight tensors...\n");
-    auto wrap_1d = [](std::shared_ptr<MeshBuffer> buf, uint32_t len) -> Tensor {
-        uint32_t padded = ((len + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
-        DeviceStorage storage(buf, {MeshCoordinate(0, 0)});
-        TensorSpec spec(
-            Shape({1, 1, 1, padded}),
-            TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-        return Tensor(std::move(storage), spec, TensorTopology{});
-    };
-
+    // Assign norm weight buffers for on-device RMSNorm
+    printf("Setting up norm weight buffers...\n");
     attn_idx = 0; ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
         if (MC::is_recurrent(layer)) {
             auto& lw = g_model.ssm_layers[ssm_idx];
-            g_wt.attn_norm[layer] = wrap_1d(lw.attn_norm, MC::n_embd);
-            g_wt.post_norm[layer] = wrap_1d(lw.post_attn_norm, MC::n_embd);
             g_wt.attn_norm_buf[layer] = lw.attn_norm;
             g_wt.post_norm_buf[layer] = lw.post_attn_norm;
             ssm_idx++;
         } else {
             auto& lw = g_model.attn_layers[attn_idx];
-            g_wt.attn_norm[layer] = wrap_1d(lw.attn_norm, MC::n_embd);
-            g_wt.post_norm[layer] = wrap_1d(lw.post_attn_norm, MC::n_embd);
             g_wt.attn_norm_buf[layer] = lw.attn_norm;
             g_wt.post_norm_buf[layer] = lw.post_attn_norm;
             attn_idx++;
@@ -1544,15 +1361,6 @@ static void create_weight_tensors() {
     g_norm_dev_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = embd_tiles * tile_bytes},
                                          dram_cfg, g_mesh.get());
 
-    TensorSpec embd_spec(
-        Shape({1, 1, 1, n_embd_padded}),
-        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
-    g_hidden_dev = Tensor(DeviceStorage(g_hidden_dev_buf, {MeshCoordinate(0, 0)}),
-                           embd_spec, TensorTopology{});
-    g_residual_dev = Tensor(DeviceStorage(g_residual_dev_buf, {MeshCoordinate(0, 0)}),
-                             embd_spec, TensorTopology{});
-    g_norm_dev = Tensor(DeviceStorage(g_norm_dev_buf, {MeshCoordinate(0, 0)}),
-                         embd_spec, TensorTopology{});
     // Pre-allocate all GEMV and FFN intermediate buffers (required before trace capture)
     printf("Pre-allocating GEMV and FFN buffers...\n");
     constexpr int combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
@@ -1698,7 +1506,7 @@ static void apply_rope_cached(float* head, int pos) {
 
 // ============================================================================
 // Forward pass: single decode token
-// Large matmuls on device via ttnn::matmul, small ops on host CPU.
+// Large matmuls on device via custom GEMV kernels, small ops on host CPU.
 // Returns pointer to static g_logits buffer (valid until next call).
 // ============================================================================
 static int g_decode_count = 0;
@@ -2229,13 +2037,10 @@ static float* forward_decode() {
 
     g_decode_count++;
     if (g_decode_count % 10 == 0) {
-        int calls = g_gemv_count > 0 ? g_gemv_count : 1;
         int dc = g_decode_count;
         printf("  [profile @%d] norm_mm=%.0f outproj=%.0f ffn=%.0f host=%.0f reswr=%.0f lmhead=%.0f ms/tok\n",
                dc, g_time_norm_mm / dc, g_time_outproj / dc, g_time_ffn / dc,
                g_time_host / dc, g_time_reswrite / dc, g_time_lmhead / dc);
-        printf("    outproj_gemv: tilize=%.2f enq=%.2f disp=%.2f read=%.2f host=%.2f ms/call (%d calls)\n",
-               g_t_tilize / calls, g_t_enqueue / calls, g_t_dispatch / calls, g_t_read / calls, g_t_host / calls, calls);
         printf("    host_detail: conv1d=%.1f deltanet=%.1f untilize=%.1f attn=%.1f ms/tok\n",
                g_time_conv1d / dc, g_time_deltanet / dc, g_time_untilize / dc, g_time_attn_host / dc);
     }
@@ -2301,7 +2106,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Pre-computing RoPE tables for %d positions...\n", max_ctx);
     precompute_rope(max_ctx);
 
-    // Create Tensor wrappers for on-device weight matrices
+    // Pack and upload weight matrices to device
     printf("Creating weight tensor wrappers...\n");
     create_weight_tensors();
 
@@ -2434,7 +2239,10 @@ void shutdown() {
     // Clear cached custom kernel workloads (must happen before device close)
     g_eltwise_cache.clear();
     g_gemv_cache.clear();
+    g_gemv_resadd_cache.clear();
+    g_fused_norm_gemv_cache.clear();
     g_rmsnorm_cache.clear();
+    g_mc_rmsnorm_cache.clear();
     g_swiglu_cache.clear();
 
     // Clear pre-allocated GEMV and FFN buffers
