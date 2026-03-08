@@ -38,6 +38,7 @@
 #include <map>
 #include <tuple>
 #include <thread>
+#include <immintrin.h>
 
 // blockfloat_common not installed in build; use source tree path
 #include "/home/ubuntu/tt-metal/tt_metal/impl/data_format/blockfloat_common.hpp"
@@ -51,8 +52,7 @@ using MC = ModelConfig;
 // ============================================================================
 // Global state
 // ============================================================================
-static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: layer weights + output projections (BFP8)
-static std::shared_ptr<MeshDevice> g_mesh2;  // chip 1: LM head only
+static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: all weights (layers + LM head)
 static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
@@ -605,6 +605,18 @@ static void norm_matmul_ops(const Tensor& norm_weight, const Tensor& weight,
                  std::nullopt, std::nullopt, gb.out_tensor);
 }
 
+// Run output norm + LM head matmul on device (fused, no host round-trip)
+static void norm_lmhead_ops() {
+    auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, g_wt.output_norm_tensor);
+    auto& gb = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+    ttnn::matmul(norm_out, g_wt.lm_head,
+                 false, true, ttnn::DRAM_MEMORY_CONFIG,
+                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, gb.out_tensor);
+}
+static MeshTraceId g_lmhead_trace;
+static bool g_lmhead_trace_valid = false;
+
 // Run outproj matmul + residual add + norm + FFN chain + residual add on device.
 // Input: g_residual_dev contains ssm_proj_in or attn_out (written by host).
 // Output: g_hidden_dev updated with outproj residual + FFN residual.
@@ -891,10 +903,10 @@ static void create_weight_tensors() {
     printf("Uploaded %d attention + %d SSM weight tensors as BFLOAT8_B (%.1fs).\n",
            attn_idx, ssm_idx, layer_sec);
 
-    // LM head on chip 1
+    // LM head on chip 0 (fused with output norm in traced chain)
     auto p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
     { std::vector<uint16_t>().swap(g_model.output_host); }
-    g_wt.lm_head = upload_packed_bfp8b(g_mesh2.get(), p_lm, MC::n_vocab, MC::n_embd);
+    g_wt.lm_head = upload_packed_bfp8b(g_mesh.get(), p_lm, MC::n_vocab, MC::n_embd);
     printf("  lm_head uploaded\n");
 
     // Wrap norm weights as device Tensors for on-device RMSNorm
@@ -1180,41 +1192,83 @@ static float* forward_decode() {
 
             for (int vh = 0; vh < num_v; vh++) {
                 int kh = vh % num_k_heads;
-                float q[head_k], k[head_k], v[head_v];
+                alignas(64) float q[head_k], k_vec[head_k], v_vec[head_v];
                 memcpy(q, conv_q + kh * head_k, head_k * sizeof(float));
-                memcpy(k, conv_k + kh * head_k, head_k * sizeof(float));
-                memcpy(v, conv_v + vh * head_v, head_v * sizeof(float));
-                float qn = 0, kn = 0;
-                for (int d = 0; d < head_k; d++) { qn += q[d]*q[d]; kn += k[d]*k[d]; }
-                qn = 1.0f / sqrtf(qn + MC::rms_norm_eps);
-                kn = 1.0f / sqrtf(kn + MC::rms_norm_eps);
-                for (int d = 0; d < head_k; d++) { q[d] *= qn; k[d] *= kn; }
+                memcpy(k_vec, conv_k + kh * head_k, head_k * sizeof(float));
+                memcpy(v_vec, conv_v + vh * head_v, head_v * sizeof(float));
+
+                // RMSNorm Q and K using AVX-512
+                __m512 vqn = _mm512_setzero_ps(), vkn = _mm512_setzero_ps();
+                for (int d = 0; d < head_k; d += 16) {
+                    __m512 vq = _mm512_load_ps(q + d);
+                    __m512 vk = _mm512_load_ps(k_vec + d);
+                    vqn = _mm512_fmadd_ps(vq, vq, vqn);
+                    vkn = _mm512_fmadd_ps(vk, vk, vkn);
+                }
+                float qn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vqn) + MC::rms_norm_eps);
+                float kn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vkn) + MC::rms_norm_eps);
+                __m512 vqn_b = _mm512_set1_ps(qn_s);
+                __m512 vkn_b = _mm512_set1_ps(kn_s);
+                for (int d = 0; d < head_k; d += 16) {
+                    _mm512_store_ps(q + d, _mm512_mul_ps(_mm512_load_ps(q + d), vqn_b));
+                    _mm512_store_ps(k_vec + d, _mm512_mul_ps(_mm512_load_ps(k_vec + d), vkn_b));
+                }
+
                 float biased = alpha_raw[vh] + lw.ssm_dt_bias_host[vh];
                 float sp = (biased > 20.0f) ? biased : logf(1.0f + fast_expf(biased));
-                float gate = sp * lw.ssm_a_host[vh];
-                float decay = expf(gate);  // keep precise for state decay
+                float gate_val = sp * lw.ssm_a_host[vh];
+                float decay = expf(gate_val);
                 float beta_val = fast_sigmoidf(beta_raw[vh]);
                 float* sh = state.data() + vh * head_v * head_k;
-                for (int j = 0; j < head_v * head_k; j++) sh[j] *= decay;
+
+                // Fused per-row: decay + dot(k) + update + dot(q)
+                // Eliminates separate bulk decay pass, halves memory traffic
+                __m512 vdecay = _mm512_set1_ps(decay);
                 for (int i = 0; i < head_v; i++) {
                     float* row = sh + i * head_k;
-                    float sk = 0;
-                    for (int j = 0; j < head_k; j++) sk += row[j] * k[j];
-                    float dd = beta_val * (v[i] - sk);
-                    for (int j = 0; j < head_k; j++) row[j] += k[j] * dd;
-                    float out = 0;
-                    for (int j = 0; j < head_k; j++) out += row[j] * q[j];
-                    ssm_proj_in[vh * head_v + i] = out * ssm_scale;
+                    // Pass 1: decay row, compute dot(row*decay, k)
+                    __m512 vsk = _mm512_setzero_ps();
+                    for (int j = 0; j < head_k; j += 16) {
+                        __m512 vr = _mm512_mul_ps(_mm512_loadu_ps(row + j), vdecay);
+                        _mm512_storeu_ps(row + j, vr);
+                        vsk = _mm512_fmadd_ps(vr, _mm512_load_ps(k_vec + j), vsk);
+                    }
+                    float sk = _mm512_reduce_add_ps(vsk);
+                    float dd = beta_val * (v_vec[i] - sk);
+                    __m512 vdd = _mm512_set1_ps(dd);
+                    // Pass 2: update row, compute dot(updated_row, q)
+                    __m512 vout = _mm512_setzero_ps();
+                    for (int j = 0; j < head_k; j += 16) {
+                        __m512 vr = _mm512_loadu_ps(row + j);
+                        __m512 vk = _mm512_load_ps(k_vec + j);
+                        vr = _mm512_fmadd_ps(vk, vdd, vr);  // row += k * dd
+                        _mm512_storeu_ps(row + j, vr);
+                        vout = _mm512_fmadd_ps(vr, _mm512_load_ps(q + j), vout);
+                    }
+                    ssm_proj_in[vh * head_v + i] = _mm512_reduce_add_ps(vout) * ssm_scale;
                 }
-                // Gated RMSNorm for this v-head
-                float sum_sq = 0;
+
+                // Gated RMSNorm for this v-head (AVX-512)
                 float* vout = ssm_proj_in + vh * head_v;
-                for (int d = 0; d < head_v; d++) sum_sq += vout[d] * vout[d];
-                float rms = 1.0f / sqrtf(sum_sq / head_v + MC::rms_norm_eps);
-                for (int d = 0; d < head_v; d++) {
-                    float normalized = vout[d] * rms * lw.ssm_norm_host[d];
-                    float z = z_raw[vh * head_v + d];
-                    vout[d] = normalized * fast_siluf(z);
+                __m512 vssq = _mm512_setzero_ps();
+                for (int d = 0; d < head_v; d += 16) {
+                    __m512 vv = _mm512_loadu_ps(vout + d);
+                    vssq = _mm512_fmadd_ps(vv, vv, vssq);
+                }
+                float rms = 1.0f / sqrtf(_mm512_reduce_add_ps(vssq) / head_v + MC::rms_norm_eps);
+                __m512 vrms = _mm512_set1_ps(rms);
+                for (int d = 0; d < head_v; d += 16) {
+                    __m512 vv = _mm512_loadu_ps(vout + d);
+                    __m512 vnorm = _mm512_mul_ps(_mm512_mul_ps(vv, vrms),
+                                                  _mm512_loadu_ps(lw.ssm_norm_host.data() + d));
+                    // SiLU(z) = z * sigmoid(z) — scalar fallback for transcendentals
+                    float tmp[16];
+                    _mm512_storeu_ps(tmp, vnorm);
+                    for (int t = 0; t < 16 && d + t < head_v; t++) {
+                        float z = z_raw[vh * head_v + d + t];
+                        tmp[t] *= fast_siluf(z);
+                    }
+                    _mm512_storeu_ps(vout + d, _mm512_loadu_ps(tmp));
                 }
             }
 
@@ -1386,18 +1440,28 @@ static float* forward_decode() {
         }
     }
 
-    // Read hidden from device for final norm + LM head
-    read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
-
-    // Final norm (host)
-    float* norm_out = g_norm_out.data();
-    rmsnorm(g_hidden_f32.data(), g_output_norm.data(), norm_out, MC::n_embd);
-
-    // LM head (DEVICE matmul on chip 1, trace idx 64)
+    // Fused output norm + LM head matmul on chip 0 (traced, no host round-trip)
     auto t_lm = Clock::now();
+    auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+
+    if (!g_lmhead_trace_valid) {
+        // Warmup
+        norm_lmhead_ops();
+        EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
+        // Capture trace
+        auto tid = g_mesh->begin_mesh_trace(0);
+        norm_lmhead_ops();
+        g_mesh->end_mesh_trace(0, tid);
+        g_lmhead_trace = tid;
+        g_lmhead_trace_valid = true;
+    } else {
+        g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+    }
+    EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
+
+    // Untilize logits
     float* logits = g_logits.data();
-    device_gemv(g_mesh2.get(), g_wt.lm_head, MC::n_vocab, MC::n_embd,
-               norm_out, logits, 64);
+    read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
     g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
 
     g_decode_count++;
@@ -1423,10 +1487,9 @@ static float* forward_decode() {
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
-    // Open chip 0 for layer weights + output projections, chip 1 for LM head
-    auto meshes = MeshDevice::create_unit_meshes({0, 1});
+    // Open chip 0 for all weights (layers + LM head)
+    auto meshes = MeshDevice::create_unit_meshes({0});
     g_mesh = meshes[0];
-    g_mesh2 = meshes[1];
 
     auto grid = g_mesh->compute_with_storage_grid_size();
     printf("Chip 0 opened: compute grid %zux%zu (%zu cores)\n",
@@ -1434,7 +1497,6 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
 
     // Enable program cache for faster repeated matmul dispatch
     g_mesh->enable_program_cache();
-    g_mesh2->enable_program_cache();
 
     MeshCommandQueue& cq = g_mesh->mesh_command_queue();
     g_max_ctx = max_ctx;
@@ -1596,13 +1658,17 @@ void shutdown() {
             g_ffn_chain_traces_valid[i] = false;
         }
     }
-    // Release gemv traces (chip 0 for all except idx 64 = LM head on chip 1)
+    // Release gemv traces (all on chip 0)
     for (int i = 0; i < 128; i++) {
         if (g_gemv_traces[i].valid) {
-            MeshDevice* dev = (i == 64) ? g_mesh2.get() : g_mesh.get();
-            dev->release_mesh_trace(g_gemv_traces[i].trace_id);
+            g_mesh->release_mesh_trace(g_gemv_traces[i].trace_id);
             g_gemv_traces[i].valid = false;
         }
+    }
+    // Release fused norm+LM head trace
+    if (g_lmhead_trace_valid) {
+        g_mesh->release_mesh_trace(g_lmhead_trace);
+        g_lmhead_trace_valid = false;
     }
 
     // Clear cached custom kernel workloads (must happen before device close)
@@ -1623,10 +1689,10 @@ void shutdown() {
     for (auto& t : g_wt.ssm_ffn_gate) t = Tensor();
     for (auto& t : g_wt.ssm_ffn_up) t = Tensor();
     for (auto& t : g_wt.ssm_ffn_down) t = Tensor();
-    // Clear weight tensor wrappers — chip 1
     for (auto& t : g_wt.attn_wo) t = Tensor();
     for (auto& t : g_wt.ssm_out) t = Tensor();
     g_wt.lm_head = Tensor();
+    g_wt.output_norm_tensor = Tensor();
 
     g_model.output_norm.reset();
     for (auto& l : g_model.attn_layers) {
@@ -1637,10 +1703,6 @@ void shutdown() {
         l.attn_norm.reset(); l.post_attn_norm.reset();
     }
 
-    if (g_mesh2) {
-        g_mesh2->close();
-        g_mesh2.reset();
-    }
     if (g_mesh) {
         g_mesh->close();
         g_mesh.reset();
