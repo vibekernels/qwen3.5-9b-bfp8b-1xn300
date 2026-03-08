@@ -308,113 +308,106 @@ bool load_gguf_weights(
         if (MC::is_recurrent(il)) {
             auto& lw = model.ssm_layers[ssm_idx];
 
-            // attn_norm: [n_embd]
+            // attn_norm: [n_embd] — small, upload to device as BF16
             auto norm_data = load_bf16(pname("attn_norm.weight"));
             lw.attn_norm = upload_1d_bf16(device, cq, norm_data.data(), MC::n_embd);
 
-            // QKV projection: attn_qkv.weight [ssm_conv_channels=8192, n_embd=4096]
+            // QKV + Gate + Alpha + Beta → combined: [12352, 4096] — store on host
             auto qkv_data = load_bf16(pname("attn_qkv.weight"));
-            // Gate projection: attn_gate.weight [ssm_d_inner=4096, n_embd=4096]
             auto gate_data = load_bf16(pname("attn_gate.weight"));
-            // Alpha: ssm_alpha.weight [ssm_dt_rank=32, n_embd=4096]
             auto alpha_data = load_bf16(pname("ssm_alpha.weight"));
-            // Beta: ssm_beta.weight [ssm_dt_rank=32, n_embd=4096]
             auto beta_data = load_bf16(pname("ssm_beta.weight"));
 
-            // Pack combined: [QKV(8192) + Z(4096) + alpha(32) + beta(32), 4096] = [12352, 4096]
             uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
                                    + MC::ssm_dt_rank + MC::ssm_dt_rank;
-            std::vector<bfloat16> combined(combined_rows * MC::n_embd);
+            lw.w_combined_host.resize(combined_rows * MC::n_embd);
+            uint16_t* dst = lw.w_combined_host.data();
             size_t off = 0;
-            memcpy(combined.data() + off, qkv_data.data(),
-                   MC::ssm_conv_channels * MC::n_embd * sizeof(bfloat16));
+            memcpy(dst + off, qkv_data.data(), MC::ssm_conv_channels * MC::n_embd * 2);
             off += MC::ssm_conv_channels * MC::n_embd;
-            memcpy(combined.data() + off, gate_data.data(),
-                   MC::ssm_d_inner * MC::n_embd * sizeof(bfloat16));
+            memcpy(dst + off, gate_data.data(), MC::ssm_d_inner * MC::n_embd * 2);
             off += MC::ssm_d_inner * MC::n_embd;
-            memcpy(combined.data() + off, alpha_data.data(),
-                   MC::ssm_dt_rank * MC::n_embd * sizeof(bfloat16));
+            memcpy(dst + off, alpha_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
             off += MC::ssm_dt_rank * MC::n_embd;
-            memcpy(combined.data() + off, beta_data.data(),
-                   MC::ssm_dt_rank * MC::n_embd * sizeof(bfloat16));
-            lw.w_combined = upload_2d_bf16(device, cq, combined.data(), combined_rows, MC::n_embd);
+            memcpy(dst + off, beta_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
 
-            // SSM parameters — stored on host as f32 (tiny, read directly without bf16 round-trip)
+            // SSM parameters — stored on host as f32
             lw.ssm_a_host = load_f32(pname("ssm_a"));
-            {
-                // GGUF dims=[4, 8192]: ne[0]=4 (kernel), ne[1]=8192 (channels)
-                // In memory: [channels=8192, kernel=4] — already the layout we want
-                lw.ssm_conv1d_host = load_f32(pname("ssm_conv1d.weight"));
-            }
+            lw.ssm_conv1d_host = load_f32(pname("ssm_conv1d.weight"));
             lw.ssm_dt_bias_host = load_f32(pname("ssm_dt.bias"));
             lw.ssm_norm_host = load_f32(pname("ssm_norm.weight"));
 
             auto ssm_out_data = load_bf16(pname("ssm_out.weight"));
             lw.ssm_out_host.resize(ssm_out_data.size());
-            memcpy(lw.ssm_out_host.data(), ssm_out_data.data(), ssm_out_data.size() * sizeof(bfloat16));
+            memcpy(lw.ssm_out_host.data(), ssm_out_data.data(), ssm_out_data.size() * 2);
 
-            // Post-attention norm
+            // Post-attention norm — small, upload to device as BF16
             auto post_norm = load_bf16(pname("post_attention_norm.weight"));
             lw.post_attn_norm = upload_1d_bf16(device, cq, post_norm.data(), MC::n_embd);
 
-            // FFN: pack gate+up → [2*n_ff, n_embd]
+            // FFN: gate and up stored separately on host
             auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
+            lw.ffn_gate_host.resize(ffn_gate.size());
+            memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
+
             auto ffn_up = load_bf16(pname("ffn_up.weight"));
-            auto ffn_gu = concat_vertical(ffn_gate.data(), MC::n_ff, ffn_up.data(), MC::n_ff, MC::n_embd);
-            lw.ffn_gate_up = upload_2d_bf16(device, cq, ffn_gu.data(), 2 * MC::n_ff, MC::n_embd);
+            lw.ffn_up_host.resize(ffn_up.size());
+            memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
 
             auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
-            lw.ffn_down = upload_2d_bf16(device, cq, ffn_down_data.data(), MC::n_embd, MC::n_ff);
+            lw.ffn_down_host.resize(ffn_down_data.size());
+            memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
 
             printf("  Layer %d: SSM (delta-net) [%d]\n", il, ssm_idx);
             ssm_idx++;
         } else {
             auto& lw = model.attn_layers[attn_idx];
 
-            // attn_norm
+            // attn_norm — small, upload to device as BF16
             auto norm_data = load_bf16(pname("attn_norm.weight"));
             lw.attn_norm = upload_1d_bf16(device, cq, norm_data.data(), MC::n_embd);
 
-            // QKV: pack Q[q_dim, n_embd] + K[kv_dim, n_embd] + V[kv_dim, n_embd]
-            // q_dim = n_head * head_dim * 2 (Q + gate) = 8192
-            // kv_dim = n_head_kv * head_dim = 1024
-            int q_dim = MC::n_head * MC::head_dim * 2;  // 8192
-            int kv_dim = MC::n_head_kv * MC::head_dim;  // 1024
-            int qkv_rows = q_dim + 2 * kv_dim;  // 10240
+            // QKV: pack Q+K+V → [qkv_rows, n_embd] — store on host
+            int q_dim = MC::n_head * MC::head_dim * 2;
+            int kv_dim = MC::n_head_kv * MC::head_dim;
+            int qkv_rows = q_dim + 2 * kv_dim;
 
             auto wq = load_bf16(pname("attn_q.weight"));
             auto wk = load_bf16(pname("attn_k.weight"));
             auto wv = load_bf16(pname("attn_v.weight"));
 
-            std::vector<bfloat16> wqkv(qkv_rows * MC::n_embd);
-            memcpy(wqkv.data(), wq.data(), q_dim * MC::n_embd * sizeof(bfloat16));
-            memcpy(wqkv.data() + q_dim * MC::n_embd, wk.data(), kv_dim * MC::n_embd * sizeof(bfloat16));
-            memcpy(wqkv.data() + (q_dim + kv_dim) * MC::n_embd, wv.data(), kv_dim * MC::n_embd * sizeof(bfloat16));
-            lw.wqkv = upload_2d_bf16(device, cq, wqkv.data(), qkv_rows, MC::n_embd);
+            lw.wqkv_host.resize(qkv_rows * MC::n_embd);
+            memcpy(lw.wqkv_host.data(), wq.data(), q_dim * MC::n_embd * 2);
+            memcpy(lw.wqkv_host.data() + q_dim * MC::n_embd, wk.data(), kv_dim * MC::n_embd * 2);
+            memcpy(lw.wqkv_host.data() + (q_dim + kv_dim) * MC::n_embd, wv.data(), kv_dim * MC::n_embd * 2);
 
-            // Output projection: [n_head*head_dim, n_embd] — stored in host memory to save DRAM
+            // Output projection — store on host
             auto wo = load_bf16(pname("attn_output.weight"));
             lw.wo_host.resize(wo.size());
-            memcpy(lw.wo_host.data(), wo.data(), wo.size() * sizeof(bfloat16));
+            memcpy(lw.wo_host.data(), wo.data(), wo.size() * 2);
 
-            // Q/K norms
+            // Q/K norms — small, upload to device as BF16
             auto qn = load_bf16(pname("attn_q_norm.weight"));
             lw.attn_q_norm = upload_1d_bf16(device, cq, qn.data(), MC::head_dim);
             auto kn = load_bf16(pname("attn_k_norm.weight"));
             lw.attn_k_norm = upload_1d_bf16(device, cq, kn.data(), MC::head_dim);
 
-            // Post-attention norm
+            // Post-attention norm — small, upload to device as BF16
             auto post_norm = load_bf16(pname("post_attention_norm.weight"));
             lw.post_attn_norm = upload_1d_bf16(device, cq, post_norm.data(), MC::n_embd);
 
-            // FFN: pack gate+up → [2*n_ff, n_embd]
+            // FFN: gate and up stored separately on host
             auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
+            lw.ffn_gate_host.resize(ffn_gate.size());
+            memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
+
             auto ffn_up = load_bf16(pname("ffn_up.weight"));
-            auto ffn_gu = concat_vertical(ffn_gate.data(), MC::n_ff, ffn_up.data(), MC::n_ff, MC::n_embd);
-            lw.ffn_gate_up = upload_2d_bf16(device, cq, ffn_gu.data(), 2 * MC::n_ff, MC::n_embd);
+            lw.ffn_up_host.resize(ffn_up.size());
+            memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
 
             auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
-            lw.ffn_down = upload_2d_bf16(device, cq, ffn_down_data.data(), MC::n_embd, MC::n_ff);
+            lw.ffn_down_host.resize(ffn_down_data.size());
+            memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
 
             printf("  Layer %d: Attention [%d]\n", il, attn_idx);
             attn_idx++;

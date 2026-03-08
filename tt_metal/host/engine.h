@@ -22,38 +22,34 @@ using TokenCallback = std::function<bool(int token_id, const std::string& text)>
 
 enum StopReason { STOP_EOS, STOP_LENGTH, STOP_CALLBACK };
 
-// Weights for a single full-attention layer, stored as DRAM MeshBuffers in tiled layout.
+// Weights for a single full-attention layer.
+// Small norm weights: BF16 MeshBuffers on device.
+// Large matmul weights: stored as host bf16 vectors, freed after BFP8_B upload.
 struct AttentionLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_norm;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> wqkv;
-    std::vector<uint16_t> wo_host;  // [n_head*head_dim, n_embd] BF16 on host to save DRAM
+    std::vector<uint16_t> wqkv_host;         // [qkv_rows, n_embd] BF16 — freed after upload
+    std::vector<uint16_t> wo_host;           // [n_head*head_dim, n_embd] BF16 — freed after upload
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_q_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_k_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_gate_up;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_down;
-    // Host-side BF16 cache for fast inference (avoids PCIe reads per token)
-    std::vector<uint16_t> wqkv_host;
-    std::vector<uint16_t> ffn_gate_up_host;
-    std::vector<uint16_t> ffn_down_host;
+    std::vector<uint16_t> ffn_gate_host;     // [n_ff, n_embd] BF16 — freed after upload
+    std::vector<uint16_t> ffn_up_host;       // [n_ff, n_embd] BF16 — freed after upload
+    std::vector<uint16_t> ffn_down_host;     // [n_embd, n_ff] BF16 — freed after upload
 };
 
 // Weights for a single SSM (delta-net) layer.
 struct SSMLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_norm;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> w_combined;
-    std::vector<float> ssm_a_host;       // [ssm_dt_rank] = [32]
-    std::vector<float> ssm_conv1d_host;  // [channels * kernel] = [8192 * 4]
-    std::vector<float> ssm_dt_bias_host; // [ssm_dt_rank] = [32]
-    std::vector<float> ssm_norm_host;    // [ssm_head_v_dim] = [128]
-    std::vector<uint16_t> ssm_out_host;  // [n_embd, ssm_d_inner] BF16 on host to save DRAM
+    std::vector<uint16_t> w_combined_host;   // [combined_rows, n_embd] BF16 — freed after upload
+    std::vector<float> ssm_a_host;           // [ssm_dt_rank] = [32]
+    std::vector<float> ssm_conv1d_host;      // [channels * kernel] = [8192 * 4]
+    std::vector<float> ssm_dt_bias_host;     // [ssm_dt_rank] = [32]
+    std::vector<float> ssm_norm_host;        // [ssm_head_v_dim] = [128]
+    std::vector<uint16_t> ssm_out_host;      // [n_embd, ssm_d_inner] BF16 — freed after upload
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_gate_up;
-    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> ffn_down;
-    // Host-side BF16 cache for fast inference
-    std::vector<uint16_t> w_combined_host;
-    std::vector<uint16_t> ffn_gate_up_host;
-    std::vector<uint16_t> ffn_down_host;
+    std::vector<uint16_t> ffn_gate_host;     // [n_ff, n_embd] BF16 — freed after upload
+    std::vector<uint16_t> ffn_up_host;       // [n_ff, n_embd] BF16 — freed after upload
+    std::vector<uint16_t> ffn_down_host;     // [n_embd, n_ff] BF16 — freed after upload
 };
 
 // Full model weight buffers on device DRAM.
