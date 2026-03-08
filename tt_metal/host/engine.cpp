@@ -683,36 +683,56 @@ static void write_f32_to_buf(std::shared_ptr<MeshBuffer> buf, const float* data,
     if (g_write_host_tiled.size() < needed)
         g_write_host_tiled.resize(needed, bfloat16(0.0f));
 
-    uint16_t* scratch = g_bf16_scratch.data();
-    const uint32_t* bits = reinterpret_cast<const uint32_t*>(data);
-    for (uint32_t i = 0; i < len; i++)
-        scratch[i] = static_cast<uint16_t>(bits[i] >> 16);
-
     uint16_t* ht = reinterpret_cast<uint16_t*>(g_write_host_tiled.data());
     uint32_t num_tile_cols = padded / TILE_WIDTH;
+    const uint32_t* bits = reinterpret_cast<const uint32_t*>(data);
     for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
         uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
         uint32_t base = tc * TILE_WIDTH;
-        memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
-        memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
+        if (base + 32 <= len) {
+            // AVX-512: fused f32→bf16 + tilize (load 16 f32, truncate to bf16, store to tile face)
+            __m512i v0 = _mm512_loadu_si512(bits + base);
+            __m512i v1 = _mm512_loadu_si512(bits + base + 16);
+            __m256i bf0 = _mm512_cvtepi32_epi16(_mm512_srli_epi32(v0, 16));
+            __m256i bf1 = _mm512_cvtepi32_epi16(_mm512_srli_epi32(v1, 16));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + tile_off), bf0);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + tile_off + 256), bf1);
+        } else {
+            // Scalar fallback
+            uint16_t* scratch = g_bf16_scratch.data();
+            for (uint32_t i = base; i < len; i++)
+                scratch[i] = static_cast<uint16_t>(bits[i] >> 16);
+            uint32_t n0 = std::min(16u, len - base);
+            uint32_t n1 = (base + 16 < len) ? std::min(16u, len - base - 16) : 0;
+            memcpy(ht + tile_off, scratch + base, n0 * sizeof(uint16_t));
+            if (n1) memcpy(ht + tile_off + 256, scratch + base + 16, n1 * sizeof(uint16_t));
+        }
     }
     EnqueueWriteMeshBuffer(cq, buf, g_write_host_tiled, false);
 }
 
-// Read gemv output buffer to host f32 (untilize + convert)
+// Read gemv output buffer to host f32 (fused untilize + bf16→f32 via AVX-512)
 static void read_gemv_to_f32(GemvBuf& gb, float* out, uint32_t M) {
-    uint16_t* scratch = g_bf16_scratch.data();
     const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
     uint32_t out_tile_cols = gb.M_padded / TILE_WIDTH;
+    uint32_t* ybits = reinterpret_cast<uint32_t*>(out);
     for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
         uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
         uint32_t base = tc * TILE_WIDTH;
-        memcpy(scratch + base, oht + tile_off, 16 * sizeof(uint16_t));
-        memcpy(scratch + base + 16, oht + tile_off + 256, 16 * sizeof(uint16_t));
+        if (base + 32 <= M) {
+            // AVX-512: load 16 bf16 from face 0, zero-extend to 32-bit, shift left 16
+            __m256i f0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off));
+            __m256i f2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off + 256));
+            _mm512_storeu_si512(ybits + base, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f0), 16));
+            _mm512_storeu_si512(ybits + base + 16, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f2), 16));
+        } else {
+            // Scalar fallback for last partial tile
+            for (uint32_t i = 0; i < 16 && base + i < M; i++)
+                ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
+            for (uint32_t i = 0; i < 16 && base + 16 + i < M; i++)
+                ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 256 + i]) << 16;
+        }
     }
-    uint32_t* ybits = reinterpret_cast<uint32_t*>(out);
-    for (uint32_t i = 0; i < M; i++)
-        ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
 }
 
 // ============================================================================
@@ -977,19 +997,19 @@ static void write_hidden_to_device(const float* f32_data) {
     if (g_dev_host_tiled.empty())
         g_dev_host_tiled.resize(n_embd_padded / TILE_WIDTH * TILE_HEIGHT * TILE_WIDTH, bfloat16(0.0f));
 
-    // Convert f32→bf16 and tilize
-    uint16_t* scratch = g_bf16_scratch.data();
-    const uint32_t* bits = reinterpret_cast<const uint32_t*>(f32_data);
-    for (uint32_t i = 0; i < (uint32_t)MC::n_embd; i++)
-        scratch[i] = static_cast<uint16_t>(bits[i] >> 16);
-
+    // Fused f32→bf16 + tilize via AVX-512
     uint16_t* ht = reinterpret_cast<uint16_t*>(g_dev_host_tiled.data());
+    const uint32_t* bits = reinterpret_cast<const uint32_t*>(f32_data);
     uint32_t num_tile_cols = n_embd_padded / TILE_WIDTH;
     for (uint32_t tc = 0; tc < num_tile_cols; tc++) {
         uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
         uint32_t base = tc * TILE_WIDTH;
-        memcpy(ht + tile_off, scratch + base, 16 * sizeof(uint16_t));
-        memcpy(ht + tile_off + 256, scratch + base + 16, 16 * sizeof(uint16_t));
+        __m512i v0 = _mm512_loadu_si512(bits + base);
+        __m512i v1 = _mm512_loadu_si512(bits + base + 16);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + tile_off),
+                            _mm512_cvtepi32_epi16(_mm512_srli_epi32(v0, 16)));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(ht + tile_off + 256),
+                            _mm512_cvtepi32_epi16(_mm512_srli_epi32(v1, 16)));
     }
     EnqueueWriteMeshBuffer(cq, g_hidden_dev_buf, g_dev_host_tiled, false);
 }
@@ -1487,7 +1507,7 @@ static float* forward_decode() {
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
-    // Open chip 0 for all weights (layers + LM head)
+    // Open chip 0 only (opening 2 devices adds ~10ms/tok driver overhead)
     auto meshes = MeshDevice::create_unit_meshes({0});
     g_mesh = meshes[0];
 
