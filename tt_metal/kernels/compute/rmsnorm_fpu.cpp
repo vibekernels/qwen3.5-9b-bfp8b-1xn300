@@ -42,7 +42,7 @@ void kernel_main() {
     constexpr uint32_t cb_eps     = tt::CBIndex::c_6;
     constexpr uint32_t cb_rsqrt   = tt::CBIndex::c_7;
     constexpr uint32_t cb_act     = tt::CBIndex::c_24;  // alias
-    constexpr uint32_t cb_out     = cb_hidden;           // reuse for output
+    constexpr uint32_t cb_out     = tt::CBIndex::c_1;   // separate output CB
 
     cb_wait_front(cb_scaler, 1);
     cb_wait_front(cb_eps, 1);

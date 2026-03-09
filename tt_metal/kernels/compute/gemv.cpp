@@ -18,7 +18,9 @@ void kernel_main() {
     constexpr uint32_t cb_weight = tt::CBIndex::c_1;
     constexpr uint32_t cb_out    = tt::CBIndex::c_16;
 
-    mm_init(cb_act, cb_weight, cb_out);
+    // transpose=1: compute C = A × B^T so GEMV y = W @ x works correctly
+    // (weight tiles stored as W[M,K], need B^T[k][j] = W[j][k])
+    mm_init(cb_act, cb_weight, cb_out, /*transpose=*/1);
 
     // Wait for all activation tiles to be loaded by reader
     cb_wait_front(cb_act, Kt);

@@ -13,7 +13,7 @@ void kernel_main() {
 
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
 
-    constexpr uint32_t cb_out = tt::CBIndex::c_0;  // reuses cb_hidden
+    constexpr uint32_t cb_out = tt::CBIndex::c_1;  // separate output CB
     uint32_t tile_size = get_tile_size(cb_out);
 
     constexpr auto acc_out_args = TensorAccessorArgs<1>();

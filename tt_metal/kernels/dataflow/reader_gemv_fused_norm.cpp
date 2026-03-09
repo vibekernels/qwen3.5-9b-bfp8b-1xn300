@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// DRAM-sharded GEMV reader with FUSED RMSNorm.
+// Multi-core GEMV reader with FUSED RMSNorm.
 // Each core independently computes RMSNorm on the full hidden vector,
 // then uses the normalized result as GEMV activations.
-// This eliminates the separate rmsnorm program + intermediate buffer.
+// Weight tiles read via TensorAccessor (interleaved buffer).
 //
 // Compile-time args: [cb_act, cb_weight, cb_norm, Kt, BLOCK,
-//                     acc_hidden_config, acc_norm_weight_config]
-// Runtime args: [hidden_addr, norm_weight_addr, weight_bank_addr,
-//                Mt_per_core, bank_id, n_elements, weight_start_offset]
+//                     acc_hidden_config, acc_norm_weight_config, acc_weight_config]
+// Runtime args: [hidden_addr, norm_weight_addr, weight_addr,
+//                Mt_per_core, n_elements, weight_start_tile]
 
 #include "api/dataflow/dataflow_api.h"
 #include <cstdint>
@@ -28,11 +28,10 @@ inline uint16_t f32_to_bf16(float f) {
 void kernel_main() {
     uint32_t hidden_addr           = get_arg_val<uint32_t>(0);
     uint32_t norm_weight_addr      = get_arg_val<uint32_t>(1);
-    uint32_t weight_bank_addr      = get_arg_val<uint32_t>(2);
+    uint32_t weight_addr           = get_arg_val<uint32_t>(2);
     uint32_t Mt_per_core           = get_arg_val<uint32_t>(3);
-    uint32_t bank_id               = get_arg_val<uint32_t>(4);
-    uint32_t n_elements            = get_arg_val<uint32_t>(5);
-    uint32_t weight_start_offset   = get_arg_val<uint32_t>(6);
+    uint32_t n_elements            = get_arg_val<uint32_t>(4);
+    uint32_t weight_start_tile     = get_arg_val<uint32_t>(5);
 
     constexpr uint32_t cb_act    = get_compile_time_arg_val(0);
     constexpr uint32_t cb_weight = get_compile_time_arg_val(1);
@@ -48,6 +47,9 @@ void kernel_main() {
     const auto acc_hidden = TensorAccessor(acc_hidden_args, hidden_addr, act_tile_size);
     constexpr auto acc_norm_w_args = TensorAccessorArgs<acc_hidden_args.next_compile_time_args_offset()>();
     const auto acc_norm_w = TensorAccessor(acc_norm_w_args, norm_weight_addr, act_tile_size);
+    // Weight accessor (interleaved)
+    constexpr auto acc_weight_args = TensorAccessorArgs<acc_norm_w_args.next_compile_time_args_offset()>();
+    const auto acc_weight = TensorAccessor(acc_weight_args, weight_addr, weight_tile_size);
 
     // ======== Phase 1: Fused RMSNorm ========
 
@@ -107,7 +109,7 @@ void kernel_main() {
             float result = bf16_to_f32(hd[j]) * norm_factor * bf16_to_f32(wd[j]);
             hd[j] = f32_to_bf16(result);
         }
-        // Face 2: elements [16..31]
+        // Face 1: elements [16..31]
         for (uint32_t j = 0; j < 16 && (base + 16 + j) < n_elements; j++) {
             float result = bf16_to_f32(hd[256 + j]) * norm_factor * bf16_to_f32(wd[256 + j]);
             hd[256 + j] = f32_to_bf16(result);
@@ -122,38 +124,24 @@ void kernel_main() {
     // Push normalized activations for compute kernel
     cb_push_back(cb_act, Kt);
 
-    // ======== Phase 2: GEMV weight reads (same as reader_gemv_dram_sharded) ========
-    uint64_t bank_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, weight_bank_addr);
-    uint32_t weight_offset = weight_start_offset;
+    // ======== Phase 2: GEMV weight reads via TensorAccessor ========
+    uint32_t weight_tile = weight_start_tile;
 
     for (uint32_t mt = 0; mt < Mt_per_core; mt++) {
         uint32_t num_blocks = (Kt + BLOCK - 1) / BLOCK;
-        uint32_t prev_trid = 0;
-        uint32_t prev_batch = 0;
 
         for (uint32_t blk = 0; blk < num_blocks; blk++) {
             uint32_t batch = ((blk + 1) * BLOCK <= Kt) ? BLOCK : (Kt - blk * BLOCK);
-            uint32_t curr_trid = (blk & 1) ? 2 : 1;
 
             cb_reserve_back(cb_weight, batch);
             uint32_t l1_base = get_write_ptr(cb_weight);
 
-            noc_async_read_set_trid(curr_trid);
-            noc_async_read(bank_noc_addr + weight_offset, l1_base, batch * weight_tile_size);
-            weight_offset += batch * weight_tile_size;
-
-            if (prev_trid != 0) {
-                noc_async_read_barrier_with_trid(prev_trid);
-                cb_push_back(cb_weight, prev_batch);
+            for (uint32_t b = 0; b < batch; b++) {
+                noc_async_read_tile(weight_tile, acc_weight, l1_base + b * weight_tile_size);
+                weight_tile++;
             }
-
-            prev_trid = curr_trid;
-            prev_batch = batch;
-        }
-
-        if (prev_trid != 0) {
-            noc_async_read_barrier_with_trid(prev_trid);
-            cb_push_back(cb_weight, prev_batch);
+            noc_async_read_barrier();
+            cb_push_back(cb_weight, batch);
         }
     }
 }
