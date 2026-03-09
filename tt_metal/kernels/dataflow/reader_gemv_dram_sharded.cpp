@@ -5,16 +5,17 @@
 // with TRID pipelining for maximum bandwidth.
 //
 // Compile-time args: [cb_act, cb_weight, Kt, BLOCK, acc_act_config]
-// Runtime args: [act_addr, weight_bank_addr, Mt_per_core, bank_id]
+// Runtime args: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
 
 #include "api/dataflow/dataflow_api.h"
 #include <cstdint>
 
 void kernel_main() {
-    uint32_t act_addr          = get_arg_val<uint32_t>(0);
-    uint32_t weight_bank_addr  = get_arg_val<uint32_t>(1);
-    uint32_t Mt_per_core       = get_arg_val<uint32_t>(2);
-    uint32_t bank_id           = get_arg_val<uint32_t>(3);
+    uint32_t act_addr              = get_arg_val<uint32_t>(0);
+    uint32_t weight_bank_addr      = get_arg_val<uint32_t>(1);
+    uint32_t Mt_per_core           = get_arg_val<uint32_t>(2);
+    uint32_t bank_id               = get_arg_val<uint32_t>(3);
+    uint32_t weight_start_offset   = get_arg_val<uint32_t>(4);
 
     constexpr uint32_t cb_act    = get_compile_time_arg_val(0);
     constexpr uint32_t cb_weight = get_compile_time_arg_val(1);
@@ -44,7 +45,7 @@ void kernel_main() {
     // Phase 2: Read weight tiles from assigned DRAM bank.
     // Large contiguous reads (BLOCK tiles per noc_async_read) + TRID pipelining.
     uint64_t bank_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, weight_bank_addr);
-    uint32_t weight_offset = 0;
+    uint32_t weight_offset = weight_start_offset;
 
     for (uint32_t mt = 0; mt < Mt_per_core; mt++) {
         uint32_t num_blocks = (Kt + BLOCK - 1) / BLOCK;

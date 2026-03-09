@@ -1,53 +1,59 @@
 # qwen3.5-9b-bf16-1xn300d
 
-Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metal/ttnn APIs.
+Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metalium APIs. No ttnn dependency — all matmuls, norms, and element-wise ops use custom Tensix kernels.
 
 ## Architecture
 
 Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (every 4th) and 24 SSM delta-net recurrent layers.
 
-- **Matrix multiplications** run on-device via `ttnn::matmul` on Tensix cores
-- **Chip 0** holds all layer weights + output projections as BFLOAT8_B (~6.75 GB)
-- **Chip 1** holds the LM head as BFLOAT8_B (~1 GB)
-- **On-device RMSNorm** via `ttnn::rms_norm` (eliminates PCIe round-trip for norm)
-- **On-device FFN chain**: output projection + residual add + norm + gate/up/down matmuls + residual add, all as a single traced operation
-- **SSM recurrence** and **attention** (softmax + KV cache) run on host CPU in f32
-- **Metal Traces** capture and replay device op sequences with zero dispatch overhead
+- **Custom DRAM-sharded GEMV kernels** on Tensix cores (12 cores per chip, one per DRAM bank, TRID pipelining)
+- **Tensor-parallel FFN** across both chips: gate/up weights split by M, down weights split by K, host-side TP reduction
+- **Custom on-device RMSNorm** (single-core FPU kernel, eliminates PCIe round-trip)
+- **Custom eltwise kernels**: add, multiply, SwiGLU, fused GEMV+residual-add
+- **On-device FFN chain**: outproj+resadd → RMSNorm → gate+up GEMV split → SwiGLU → down GEMV+resadd, all as a single traced operation per chip
+- **Fused gate+up GEMV** with split writer kernel (single weight matrix, two output buffers)
+- **SSM recurrence** and **attention** (online softmax + KV cache) run on host CPU in f32 with AVX-512
+- **Metal Traces** capture and replay device op sequences with near-zero dispatch overhead
+- **BFP8_B weights** (8-bit block floating point, 1088 bytes/tile) — 47% less DRAM bandwidth than BF16
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~115-130 ms/tok |
-| Decode throughput | ~8-9 tok/s |
-| Model size (device) | ~7.75 GB BFLOAT8_B |
-| Theoretical floor | ~88 ms/tok (DRAM bandwidth limited) |
+| Decode latency | ~65 ms/tok |
+| Decode throughput | ~15.4 tok/s |
+| Model size (device) | ~9.5 GB BFP8_B across 2 chips |
+| DRAM bandwidth utilization | ~75 GB/s per chip (~93% of achievable) |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first token is slower (~160ms) while traces are captured; subsequent tokens stabilize at ~115-130ms.
+Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first few tokens are slower while traces are captured; subsequent tokens stabilize at ~65ms.
 
-### Decode time breakdown (steady state, token 90+)
+### Decode time breakdown (steady state)
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| norm + matmul traces | 84 ms | Includes waiting for previous FFN chain; DRAM bandwidth limited |
-| Host SSM/attention | 15-18 ms | Delta-net recurrence (12ms) + conv1d (1.3ms) + attention (2-3ms) |
-| LM head (chip 1) | 15 ms | 248K x 4096 BFP8 matmul, bandwidth limited |
-| Residual writes | 13 ms | 32 PCIe writes per token (tilize + enqueue) |
-| FFN chain dispatch | ~0 ms | Non-blocking, overlaps with next layer's norm wait |
+| norm + pre-layer GEMV | 54 ms | Includes waiting for previous FFN chain (35.8ms) + GEMV read (18.3ms) |
+| FFN chain (device) | 29.3 ms | Overlaps with host pipeline; ~0.9 ms/layer |
+| TP reduction | 6.4 ms | Host-side: read both chips, f32 add, write back |
+| Host compute | 3 ms | conv1d (0.5ms), deltanet (2.0ms), attention (0.3ms) |
+| Residual writes | 2 ms | 32 PCIe writes per token |
+| LM head | 6 ms | Output norm + 2-chip parallel GEMV + read |
+| FFN dispatch | 3 ms | Non-blocking trace replay |
 
-### Why 30 tok/s is not achievable
+### Performance history
 
-The fundamental bottleneck is DRAM bandwidth:
-- **6.75 GB** of BFP8 weights must be read per token
-- At ~115 GB/s effective DRAM bandwidth: **59 ms minimum** just for weight reads
-- Plus PCIe overhead (13ms), LM head (15ms), host compute (15ms)
-- **Theoretical floor: ~88 ms/tok = 11.4 tok/s**
-
-For reference, Qwen 2.5 7B (smaller, pure attention) achieves ~22 tok/s on N300.
+| Milestone | ms/tok | tok/s | Key change |
+|-----------|--------|-------|------------|
+| Initial | ~700 | ~1.4 | ttnn::matmul on device |
+| +BFP8_B packing | ~480 | ~2.1 | 47% less weight bandwidth |
+| +Pre-alloc buffers | ~290 | ~3.4 | Zero-alloc dispatch |
+| +Dual chip TP | ~165 | ~6.1 | 2x DRAM bandwidth for FFN |
+| +Custom GEMV kernels | ~140 | ~7.1 | DRAM-sharded, TRID pipeline |
+| +Traced execution | ~90 | ~11.1 | Minimal dispatch overhead |
+| +LoFi math fidelity | ~65 | ~15.4 | Faster Tensix compute |
 
 ## Building
 
-Requires tt-metal built from source (with `_ttnncpp.so`) and clang-20.
+Requires tt-metal built from source and clang-20.
 
 ```sh
 cd tt_metal
@@ -75,7 +81,7 @@ All tests require `sudo` and `TT_METAL_RUNTIME_ROOT`:
 
 ```sh
 sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_device        # validate N300 device opens
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic ttnn::matmul
+sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic matmul
 sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_load_weights  # GGUF weight loading
 sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full generation test
 ```
@@ -86,14 +92,24 @@ sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full g
 tt_metal/
   CMakeLists.txt              # build system
   host/
-    engine.cpp                # inference engine (forward pass, generate loop)
+    engine.cpp                # inference engine (~3400 lines): forward pass, generate loop
     engine.h                  # public API: load_model_and_tokenizer(), generate(), etc.
     gguf_loader.cpp           # GGUF weight loading into device DRAM MeshBuffers
     gguf_loader.h             # loader interface
     model_config.h            # Qwen3.5-9B hyperparameters and tile dimensions
   kernels/
-    compute/                  # Tensix compute kernels (unused -- matmuls via ttnn)
-    dataflow/                 # data movement kernels (unused -- using ttnn API)
+    compute/
+      gemv.cpp                # GEMV compute kernel (matmul_tiles accumulation)
+      rmsnorm.cpp             # RMSNorm compute kernel
+      eltwise_binary.cpp      # Element-wise add/multiply compute kernel
+      swiglu.cpp              # SwiGLU activation compute kernel
+    dataflow/
+      reader_gemv_dram_sharded.cpp  # DRAM-sharded GEMV reader (TRID pipelining)
+      reader_gemv_fused_norm.cpp    # Fused norm+GEMV reader (experimental, unused)
+      writer_gemv.cpp               # Standard GEMV writer
+      writer_gemv_split.cpp         # Split writer (gate+up → two buffers)
+      writer_gemv_resadd.cpp        # GEMV writer with fused residual add
+      reader_binary_tiles_multicore.cpp  # Multi-core binary tile reader
   tests/
     test_device.cpp           # device validation
     test_matmul.cpp           # basic matmul test
@@ -106,14 +122,17 @@ src/
 
 ## Key optimizations
 
-- **BFLOAT8_B weights** on device (halves DRAM reads vs BF16, native HW decompression)
-- **Metal Traces** for norm+matmul and FFN chain ops (zero dispatch overhead on replay)
-- **On-device RMSNorm + FFN chain**: outproj + residual add + norm + gate(SiLU)/up/down matmuls + residual add, all in one traced sequence per layer
-- **Two-chip split**: chip 0 for 32 layer weights, chip 1 for LM head (avoids DRAM contention)
+- **Custom DRAM-sharded GEMV**: 12 reader cores (one per DRAM bank) with TRID-pipelined weight reads for maximum bandwidth
+- **BFP8_B weights** (1088 bytes/tile vs 2048 for BF16) with native hardware decompression
+- **Tensor-parallel FFN** across 2 chips: each chip handles half the FFN width
+- **Fused gate+up GEMV**: single weight matrix with split writer avoids redundant activation reads
+- **Fused GEMV+residual-add**: output projection and residual addition in one kernel pass
+- **Metal Traces** for norm+GEMV and FFN chain ops (near-zero dispatch overhead on replay)
+- **LoFi math fidelity** for all GEMVs (faster Tensix multiply-accumulate)
+- **Async chip 1 dispatch**: hidden state write to chip 1 overlaps with chip 0 GEMV
+- **2-chip LM head**: vocabulary rows split across chips for 2x read bandwidth
+- **AVX-512 host compute**: vectorized conv1d, deltanet recurrence, attention, RoPE
 - **Pre-allocated device buffers** for zero-allocation GEMV dispatch
-- **Fast approximate exp()** (Schraudolph's method) for SiLU/sigmoid in conv1d and gated norm
-- **Vectorized conv1d**: separated convolution from state update for auto-vectorization
 - **Pre-computed RoPE tables** (avoids trig calls per token)
-- **Raw bf16 bit operations** for f32<->bf16 conversion (avoids bfloat16 class overhead)
+- **Raw bf16 bit operations** for f32<->bf16 conversion (no bfloat16 class overhead)
 - **Static scratch buffers** for all forward pass intermediates (no heap allocation per token)
-- **Program cache enabled** for faster repeated matmul dispatch

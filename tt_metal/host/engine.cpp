@@ -323,7 +323,7 @@ static void dispatch_eltwise_binary(MeshDevice* device, uint32_t op_type,
         std::vector<uint32_t> compute_ct_args = {n_tiles, op_type};
         CreateKernel(program,
             kernel_path("compute/eltwise_binary.cpp"), core,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
         TensorAccessorArgs(*dst_buf).append_to(writer_ct_args);
@@ -426,7 +426,7 @@ static void dispatch_gemv(MeshDevice* device,
         std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/gemv.cpp"), all_cores,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer kernel: writes output tiles to interleaved out_buf
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
@@ -445,10 +445,10 @@ static void dispatch_gemv(MeshDevice* device,
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
-            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id]
+            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, b});
+                            mt_this_core, b, 0u});
 
             // Compute: [Mt_per_core]
             SetRuntimeArgs(program, compute_kid, core,
@@ -552,7 +552,7 @@ static void dispatch_gemv_resadd(MeshDevice* device,
         std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/gemv.cpp"), all_cores,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer: fused resadd writer (reads residual, adds output, writes back)
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
@@ -572,7 +572,7 @@ static void dispatch_gemv_resadd(MeshDevice* device,
 
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, b});
+                            mt_this_core, b, 0u});
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)residual_buf->address(), mt_this_core, start_row});
@@ -666,7 +666,7 @@ static void dispatch_gemv_split(MeshDevice* device,
         std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/gemv.cpp"), all_cores,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer: split writer (gate/up to separate buffers)
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
@@ -687,7 +687,7 @@ static void dispatch_gemv_split(MeshDevice* device,
 
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, b});
+                            mt_this_core, b, 0u});
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address(),
@@ -796,7 +796,7 @@ static void dispatch_gemv_fused_norm(MeshDevice* device,
         std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/gemv.cpp"), all_cores,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer: standard output writer
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
@@ -814,15 +814,145 @@ static void dispatch_gemv_fused_norm(MeshDevice* device,
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
-            // Reader: [hidden_addr, norm_weight_addr, weight_bank_addr, Mt_per_core, bank_id, n_elements]
+            // Reader: [hidden_addr, norm_weight_addr, weight_bank_addr, Mt_per_core, bank_id, n_elements, weight_start_offset]
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)hidden_buf->address(), (uint32_t)norm_weight_buf->address(),
-                            (uint32_t)weight_buf->address(), mt_this_core, b, n_elements});
+                            (uint32_t)weight_buf->address(), mt_this_core, b, n_elements, 0u});
 
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
 
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)out_buf->address(), mt_this_core, start_row});
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached fused-norm GEMV split: rmsnorm(hidden, norm_w) → gate/up GEMV with split output
+struct CachedFusedNormGemvSplitWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>, CachedFusedNormGemvSplitWorkload> g_fused_norm_gemv_split_cache;
+
+static void dispatch_gemv_fused_norm_split(MeshDevice* device,
+                                            std::shared_ptr<MeshBuffer> hidden_buf,
+                                            std::shared_ptr<MeshBuffer> norm_weight_buf,
+                                            std::shared_ptr<MeshBuffer> weight_buf,
+                                            std::shared_ptr<MeshBuffer> dst0_buf,
+                                            std::shared_ptr<MeshBuffer> dst1_buf,
+                                            uint32_t M_total, uint32_t K, uint32_t split_M,
+                                            uint32_t n_elements,
+                                            tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uintptr_t)device, (uint32_t)hidden_buf->address(),
+                               (uint32_t)norm_weight_buf->address(),
+                               (uint32_t)weight_buf->address(),
+                               (uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address());
+    auto& cached = g_fused_norm_gemv_split_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+
+        uint32_t Kt = K / TILE_WIDTH;
+        uint32_t Mt = M_total / TILE_HEIGHT;
+        uint32_t split_tile = split_M / TILE_HEIGHT;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
+        uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
+
+        Program program = CreateProgram();
+
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+        uint32_t weight_tile_bytes = tile_size(weight_format);
+
+        uint32_t effective_block = 16;
+        uint32_t weight_cb_tiles = effective_block * 2;
+
+        // Activation CB (c_0): Kt tiles for hidden + normalized activations
+        CircularBufferConfig cb_act_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_act_cfg);
+
+        // Weight CB (c_1): double-buffered
+        CircularBufferConfig cb_weight_cfg =
+            CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+                .set_page_size(CBIndex::c_1, weight_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_weight_cfg);
+
+        // Norm weight CB (c_2): Kt tiles
+        CircularBufferConfig cb_norm_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_norm_cfg);
+
+        // Output CB (c_16): 2 tiles
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
+
+        // Reader: fused rmsnorm + GEMV reader
+        std::vector<uint32_t> reader_ct_args = {
+            (uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, (uint32_t)CBIndex::c_2,
+            Kt, effective_block
+        };
+        TensorAccessorArgs(*hidden_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*norm_weight_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_gemv_fused_norm.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute: same GEMV kernel
+        std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), all_cores,
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
+
+        // Writer: split writer (gate/up to separate buffers)
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*dst0_buf).append_to(writer_ct_args);
+        TensorAccessorArgs(*dst1_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_split.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = dram_workers[b];
+            uint32_t start_row = b * Mt_per_bank;
+            uint32_t mt_this_core = (start_row >= Mt) ? 0 :
+                                    std::min(Mt_per_bank, Mt - start_row);
+
+            // Reader: [hidden_addr, norm_weight_addr, weight_bank_addr, Mt_per_core, bank_id, n_elements, weight_start_offset]
+            SetRuntimeArgs(program, reader_kid, core,
+                           {(uint32_t)hidden_buf->address(), (uint32_t)norm_weight_buf->address(),
+                            (uint32_t)weight_buf->address(), mt_this_core, b, n_elements, 0u});
+
+            SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
+
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address(),
+                            mt_this_core, start_row, split_tile});
         }
 
         cached.workload = MeshWorkload();
@@ -906,7 +1036,7 @@ static void dispatch_swiglu(MeshDevice* device,
         // Compute: SwiGLU with runtime num_tiles
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/swiglu_multicore.cpp"), all_cores,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi});
 
         // Writer: writes output tiles with start offset
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
@@ -1213,7 +1343,7 @@ static void dispatch_rmsnorm_fpu(MeshDevice* device,
         std::vector<uint32_t> compute_ct_args = {Kt};
         auto compute_kid = CreateKernel(program,
             kernel_path("compute/rmsnorm_fpu.cpp"), core_set,
-            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer kernel
         std::vector<uint32_t> writer_ct_args = {Kt};
@@ -1289,6 +1419,9 @@ static bool g_ffn_chain_traces_valid[32] = {};
 // Chip 1 FFN chain traces (for tensor-parallel FFN)
 static MeshTraceId g_ffn_chain_traces_1[32];
 static bool g_ffn_chain_traces_valid_1[32] = {};
+// Chip 1 norm+matmul traces (for TP combined_proj/QKV)
+static MeshTraceId g_norm_matmul_traces_1[32];
+static bool g_norm_matmul_traces_valid_1[32] = {};
 
 // Run rmsnorm on device + GEMV on device (no host round-trip for norm).
 // Hidden must already be on device in g_hidden_dev_buf.
@@ -1300,6 +1433,17 @@ static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
                           g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), M, K);
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
+}
+
+// Chip 1 version: rmsnorm + GEMV on chip 1's hidden/norm buffers
+static void norm_matmul_ops_1(std::shared_ptr<MeshBuffer> norm_weight_buf,
+                               std::shared_ptr<MeshBuffer> weight_buf,
+                               uint32_t M, uint32_t K) {
+    constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
+    dispatch_rmsnorm_fpu(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
+                          g_norm_dev_buf_1, MC::n_embd, embd_tiles);
+    auto& gb = get_gemv_buf(g_mesh1.get(), M, K);
+    dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, weight_buf, gb.out_buf, M, K);
 }
 
 // Run output norm + LM head matmul on device (custom kernels, no host round-trip)
@@ -1334,8 +1478,6 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
 
     // 3. FFN: fused gate+up GEMV → SwiGLU → down matmul + residual add
     auto& fb = get_ffn_buf(g_mesh.get());
-
-    // Fused gate+up projection (single GEMV, split writer to gate_buf and up_buf)
     dispatch_gemv_split(g_mesh.get(), g_norm_dev_buf, gate_up_weight_buf,
                         fb.gate_buf, fb.up_buf, MC::n_ff * 2, MC::n_embd, MC::n_ff);
 
@@ -1836,7 +1978,7 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.ssm_out_host); }
 
-            // Upload combined weights to chip 0
+            // Upload combined weights to chip 0 (full, not split)
             g_wt.ssm_w_combined_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
 
             if (g_mesh1) {
@@ -1899,7 +2041,7 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.wo_host); }
 
-            // Upload QKV weights to chip 0
+            // Upload QKV weights to chip 0 (full, not split)
             g_wt.attn_wqkv_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
 
             if (g_mesh1) {
@@ -1985,11 +2127,12 @@ static void create_weight_tensors() {
     g_wt.output_norm_buf = g_model.output_norm;
     g_output_norm_buf = g_model.output_norm;
 
-    // Copy post_norm and outproj norm weights to chip 1 for TP FFN chain
+    // Copy post_norm and attn_norm weights to chip 1 for TP FFN chain + TP combined_proj
     if (g_mesh1) {
-        printf("Copying norm weights to chip 1 for TP FFN...\n");
+        printf("Copying norm weights to chip 1 for TP...\n");
         for (int layer = 0; layer < MC::n_layers; layer++) {
             g_wt.post_norm_buf_1[layer] = copy_norm_buf_to_chip1(g_wt.post_norm_buf[layer]);
+            g_wt.attn_norm_buf_1[layer] = copy_norm_buf_to_chip1(g_wt.attn_norm_buf[layer]);
         }
     }
 
@@ -2227,6 +2370,7 @@ static double g_time_gemv = 0, g_time_ffn = 0, g_time_ssm = 0, g_time_attn = 0, 
 static double g_time_outproj = 0, g_time_reswrite = 0, g_time_host = 0, g_time_norm_mm = 0;
 static double g_time_conv1d = 0, g_time_deltanet = 0, g_time_untilize = 0, g_time_attn_host = 0;
 static double g_time_ffn_wait = 0, g_time_rmsnorm_write = 0, g_time_gemv_read = 0;
+static double g_time_tp_reduce = 0, g_time_ffn_device = 0;
 
 static float* forward_decode() {
     using Clock = std::chrono::high_resolution_clock;
@@ -2410,9 +2554,12 @@ static float* forward_decode() {
                     read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
                 });
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+                auto t_dev_done = Clock::now();
+                g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
                 g_chip1_writer.wait();
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
+                g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
             } else if (layer > 0) {
                 Finish(cq0);
             }
@@ -2679,15 +2826,23 @@ static float* forward_decode() {
                     read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
                 });
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
+                auto t_dev_done = Clock::now();
+                g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
                 g_chip1_writer.wait();
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
+                g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
             } else if (layer > 0) {
                 Finish(cq0);
             }
 
             auto t_after_read = Clock::now();
             g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
+
+            // On-device rmsnorm + QKV GEMV
+            constexpr int q_dim = MC::n_head * MC::head_dim * 2;
+            constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
+            float* qkv = g_qkv.data();
 
             // Start async write of hidden to chip 1 (overlaps with GEMV on chip 0)
             if (g_mesh1) {
@@ -2696,33 +2851,26 @@ static float* forward_decode() {
                 });
             }
 
-            // On-device rmsnorm + QKV GEMV trace
-            constexpr int q_dim = MC::n_head * MC::head_dim * 2;
-            constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
-            float* qkv = g_qkv.data();
-
-            {
-                if (!g_norm_matmul_traces_valid[layer]) {
-                    norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
-                                    g_qkv_rows, MC::n_embd);
-                    Finish(cq0);
-                    auto tid = g_mesh->begin_mesh_trace(0);
-                    norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
-                                    g_qkv_rows, MC::n_embd);
-                    g_mesh->end_mesh_trace(0, tid);
-                    g_norm_matmul_traces[layer] = tid;
-                    g_norm_matmul_traces_valid[layer] = true;
-                } else {
-                    g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
-                }
-
-                auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
-                EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
-                g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
-                g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-
-                read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
+            if (!g_norm_matmul_traces_valid[layer]) {
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                g_qkv_rows, MC::n_embd);
+                Finish(cq0);
+                auto tid = g_mesh->begin_mesh_trace(0);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                g_qkv_rows, MC::n_embd);
+                g_mesh->end_mesh_trace(0, tid);
+                g_norm_matmul_traces[layer] = tid;
+                g_norm_matmul_traces_valid[layer] = true;
+            } else {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
             }
+
+            auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
+            EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
+            g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
+            g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+            read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
 
             auto t_host1 = Clock::now();
             // 2. Deinterleave Q and gate
@@ -2982,6 +3130,8 @@ static float* forward_decode() {
                g_time_conv1d / dc, g_time_deltanet / dc, g_time_untilize / dc, g_time_attn_host / dc);
         printf("    norm_mm_detail: ffn_wait=%.1f rmsnorm_write=%.1f gemv_read=%.1f ms/tok\n",
                g_time_ffn_wait / dc, g_time_rmsnorm_write / dc, g_time_gemv_read / dc);
+        printf("    tp_detail: ffn_device=%.1f tp_reduce=%.1f ms/tok\n",
+               g_time_ffn_device / dc, g_time_tp_reduce / dc);
     }
 
     return logits;
@@ -3026,14 +3176,14 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
 
     // Query DRAM bank topology for sharded GEMV (chip 0)
     g_num_dram_banks = g_mesh->num_dram_channels();
-    g_dram_workers = g_mesh->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_0);
+    g_dram_workers = g_mesh->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_1);
     printf("Chip 0 DRAM banks: %u, optimal workers:\n", g_num_dram_banks);
     for (uint32_t b = 0; b < g_num_dram_banks; b++) {
         printf("  bank %u -> core (%zu, %zu)\n", b, g_dram_workers[b].x, g_dram_workers[b].y);
     }
     if (g_mesh1) {
         g_num_dram_banks_1 = g_mesh1->num_dram_channels();
-        g_dram_workers_1 = g_mesh1->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_0);
+        g_dram_workers_1 = g_mesh1->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_1);
         printf("Chip 1 DRAM banks: %u\n", g_num_dram_banks_1);
     }
 
