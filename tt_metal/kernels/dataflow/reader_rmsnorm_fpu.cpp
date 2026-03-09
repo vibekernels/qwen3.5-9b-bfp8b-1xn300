@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Reader for single-core FPU-based RMSNorm.
-// Reads hidden tiles, norm weight tiles, and generates scaler/epsilon tiles.
-//
-// Compile-time args: [Kt, acc_hidden_config, acc_norm_w_config]
-// Runtime args: [hidden_addr, norm_w_addr, n_elements]
+// Reads input + weight from DRAM, generates scaler/epsilon tiles.
 
 #include "api/dataflow/dataflow_api.h"
 #include <cstdint>
@@ -14,10 +11,19 @@ inline uint16_t f32_to_bf16_bits(float f) {
     return static_cast<uint16_t>(bits >> 16);
 }
 
+// Fill tile with a pre-computed bf16 value (passed as uint16_t bits)
+inline void fill_tile_bf16(uint32_t addr, uint32_t tile_size, uint16_t bf16_val) {
+    volatile tt_l1_ptr uint16_t* p = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
+    uint32_t n_elems = tile_size / sizeof(uint16_t);
+    for (uint32_t i = 0; i < n_elems; i++)
+        p[i] = bf16_val;
+}
+
 void kernel_main() {
-    uint32_t hidden_addr  = get_arg_val<uint32_t>(0);
-    uint32_t norm_w_addr  = get_arg_val<uint32_t>(1);
-    uint32_t n_elements   = get_arg_val<uint32_t>(2);
+    uint32_t hidden_addr   = get_arg_val<uint32_t>(0);
+    uint32_t norm_w_addr   = get_arg_val<uint32_t>(1);
+    uint32_t n_elements    = get_arg_val<uint32_t>(2);
+    uint32_t scaler_bf16   = get_arg_val<uint32_t>(3);  // pre-computed 1/N as bf16 bits
 
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
 
@@ -33,43 +39,22 @@ void kernel_main() {
     constexpr auto acc_norm_w_args = TensorAccessorArgs<acc_hidden_args.next_compile_time_args_offset()>();
     const auto acc_norm_w = TensorAccessor(acc_norm_w_args, norm_w_addr, tile_size);
 
-    // Generate scaler tile (1/N)
+    // Generate scaler tile: all elements = 1/N (pre-computed on host)
     {
-        float inv_n = 1.0f / (float)n_elements;
-        uint16_t inv_n_bf16 = f32_to_bf16_bits(inv_n);
-        uint32_t packed = ((uint32_t)inv_n_bf16 << 16) | inv_n_bf16;
-
         cb_reserve_back(cb_scaler, 1);
-        uint32_t addr = get_write_ptr(cb_scaler);
-        volatile tt_l1_ptr uint32_t* p =
-            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(addr);
-
-        for (uint32_t i = 0; i < tile_size / sizeof(uint32_t); i++) p[i] = 0;
-        for (uint32_t i = 0; i < 8; i++) p[i] = packed;
-        for (uint32_t i = 0; i < 8; i++) p[128 + i] = packed;
-        for (uint32_t i = 0; i < 8; i++) p[256 + i] = packed;
-        for (uint32_t i = 0; i < 8; i++) p[384 + i] = packed;
+        fill_tile_bf16(get_write_ptr(cb_scaler), tile_size, (uint16_t)scaler_bf16);
         cb_push_back(cb_scaler, 1);
     }
 
-    // Generate epsilon tile
+    // Generate epsilon tile: all elements = 1e-6
     {
-        float eps = 1e-6f;
-        uint16_t eps_bf16 = f32_to_bf16_bits(eps);
-
         cb_reserve_back(cb_eps, 1);
-        uint32_t addr = get_write_ptr(cb_eps);
-        volatile tt_l1_ptr uint32_t* p =
-            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(addr);
-
-        for (uint32_t i = 0; i < tile_size / sizeof(uint32_t); i++) p[i] = 0;
-        volatile tt_l1_ptr uint16_t* u16 =
-            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
-        u16[0] = eps_bf16;
+        uint16_t eps_bf16 = f32_to_bf16_bits(1e-6f);
+        fill_tile_bf16(get_write_ptr(cb_eps), tile_size, eps_bf16);
         cb_push_back(cb_eps, 1);
     }
 
-    // Read all hidden tiles
+    // Read all hidden tiles into cb_hidden
     cb_reserve_back(cb_hidden, Kt);
     uint32_t base = get_write_ptr(cb_hidden);
     for (uint32_t kt = 0; kt < Kt; kt++)
@@ -77,11 +62,11 @@ void kernel_main() {
     noc_async_read_barrier();
     cb_push_back(cb_hidden, Kt);
 
-    // Read all norm weight tiles
+    // Read norm weights into cb_norm_w
     cb_reserve_back(cb_norm_w, Kt);
-    base = get_write_ptr(cb_norm_w);
+    uint32_t w_base = get_write_ptr(cb_norm_w);
     for (uint32_t kt = 0; kt < Kt; kt++)
-        noc_async_read_tile(kt, acc_norm_w, base + kt * tile_size);
+        noc_async_read_tile(kt, acc_norm_w, w_base + kt * tile_size);
     noc_async_read_barrier();
     cb_push_back(cb_norm_w, Kt);
 }

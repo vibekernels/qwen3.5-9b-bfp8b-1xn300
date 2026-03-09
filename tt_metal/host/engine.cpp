@@ -1297,10 +1297,10 @@ static void dispatch_rmsnorm_fpu(MeshDevice* device,
                 .set_page_size(CBIndex::c_0, bf16_tile_bytes);
         CreateCircularBuffer(program, core_set, cb_hidden_cfg);
 
-        // cb_out (c_1): Kt tiles — separate output (avoids race with writer)
+        // cb_out (c_16): Kt tiles — packer output CB
         CircularBufferConfig cb_out_cfg =
-            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_1, tt::DataFormat::Float16_b}})
-                .set_page_size(CBIndex::c_1, bf16_tile_bytes);
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
         CreateCircularBuffer(program, core_set, cb_out_cfg);
 
         // cb_norm_w (c_2): Kt tiles
@@ -1350,12 +1350,6 @@ static void dispatch_rmsnorm_fpu(MeshDevice* device,
                                .noc = NOC::RISCV_1_default,
                                .compile_args = reader_ct_args});
 
-        // Compute kernel
-        std::vector<uint32_t> compute_ct_args = {Kt};
-        auto compute_kid = CreateKernel(program,
-            kernel_path("compute/rmsnorm_fpu.cpp"), core_set,
-            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
-
         // Writer kernel
         std::vector<uint32_t> writer_ct_args = {Kt};
         TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
@@ -1366,9 +1360,23 @@ static void dispatch_rmsnorm_fpu(MeshDevice* device,
                                .noc = NOC::RISCV_0_default,
                                .compile_args = writer_ct_args});
 
+        // Compute kernel
+        std::vector<uint32_t> compute_ct_args = {Kt};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/rmsnorm_fpu.cpp"), core_set,
+            ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
+
+        // Scaler for REDUCE_SCALAR: applied twice (element-wise + post-multiply),
+        // so use sqrt(1/N) to get effective 1/N scaling
+        float scaler_f32 = 1.0f / std::sqrt((float)n_elements);
+        uint32_t scaler_bits;
+        std::memcpy(&scaler_bits, &scaler_f32, 4);
+        uint32_t scaler_bf16 = scaler_bits >> 16;
+
         // Runtime args
         SetRuntimeArgs(program, reader_kid, core,
-                       {(uint32_t)in_buf->address(), (uint32_t)weight_buf->address(), n_elements});
+                       {(uint32_t)in_buf->address(), (uint32_t)weight_buf->address(),
+                        n_elements, scaler_bf16});
         SetRuntimeArgs(program, writer_kid, core,
                        {(uint32_t)out_buf->address()});
 
@@ -1440,8 +1448,8 @@ static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
                             std::shared_ptr<MeshBuffer> weight_buf,
                             uint32_t M, uint32_t K) {
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
-                     g_norm_dev_buf, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                         g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), M, K);
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
 }
@@ -1451,8 +1459,8 @@ static void norm_matmul_ops_1(std::shared_ptr<MeshBuffer> norm_weight_buf,
                                std::shared_ptr<MeshBuffer> weight_buf,
                                uint32_t M, uint32_t K) {
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
-                     g_norm_dev_buf_1, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
+                         g_norm_dev_buf_1, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh1.get(), M, K);
     dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, weight_buf, gb.out_buf, M, K);
 }
@@ -1462,8 +1470,8 @@ static std::shared_ptr<MeshBuffer> g_output_norm_buf;
 static std::shared_ptr<MeshBuffer> g_lm_head_buf;
 static void norm_lmhead_ops() {
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_output_norm_buf,
-                     g_norm_dev_buf, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, g_output_norm_buf,
+                         g_norm_dev_buf, MC::n_embd, embd_tiles);
     auto& gb = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb.out_buf, MC::n_vocab, MC::n_embd);
 }
@@ -1482,10 +1490,10 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
                          g_hidden_dev_buf, outproj_M, outproj_K);
 
-    // 2. RMSNorm (single-core FPU)
+    // 2. RMSNorm (FPU-based)
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
-                     g_norm_dev_buf, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                         g_norm_dev_buf, MC::n_embd, embd_tiles);
 
     // 3. FFN: fused gate+up GEMV → SwiGLU → down matmul + residual add
     auto& fb = get_ffn_buf(g_mesh.get());
@@ -1512,8 +1520,8 @@ static void outproj_ffn_chain_ops_tp0(
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
                          g_hidden_dev_buf, outproj_M, outproj_K);
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
-                     g_norm_dev_buf, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                         g_norm_dev_buf, MC::n_embd, embd_tiles);
     dispatch_gemv_split(g_mesh.get(), g_norm_dev_buf, gate_up_weight_buf,
                         g_tp_ffn_0.gate_buf, g_tp_ffn_0.up_buf,
                         n_ff_tp * 2, MC::n_embd, n_ff_tp);
@@ -1534,8 +1542,8 @@ static void outproj_ffn_chain_ops_tp1(
     dispatch_gemv_resadd(g_mesh1.get(), g_residual_dev_buf_1, outproj_weight_buf,
                          g_hidden_dev_buf_1, outproj_M, outproj_K);
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
-                     g_norm_dev_buf_1, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
+                         g_norm_dev_buf_1, MC::n_embd, embd_tiles);
     dispatch_gemv_split(g_mesh1.get(), g_norm_dev_buf_1, gate_up_weight_buf,
                         g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
                         n_ff_tp * 2, MC::n_embd, n_ff_tp);
@@ -2377,14 +2385,14 @@ static float* forward_decode() {
     // Write hidden state to device (chip 0) — stays on device through all layers
     write_hidden_to_device(g_hidden_f32.data());
 
-    // One-time micro-benchmark: measure per-program overhead at decode 5 (single-chip only)
-    if (g_decode_count == 5 && !g_mesh1) {
+    // One-time micro-benchmark: measure per-program overhead at decode 5
+    if (g_decode_count == 5) {
         Finish(cq0);  // drain everything
         auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
 
         // Warmup: ensure cached
-        dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
-                         g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
+        dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+                             g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
         dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[0],
                       gb_test.out_buf, g_combined_rows, MC::n_embd);
         Finish(cq0);
@@ -2460,8 +2468,8 @@ static float* forward_decode() {
         Finish(cq0);
         auto t6a = Clock::now();
         for (int r = 0; r < 10; r++) {
-            dispatch_rmsnorm(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
-                             g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
+            dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, g_wt.attn_norm_buf[0],
+                                 g_norm_dev_buf, MC::n_embd, MC::n_embd / TILE_WIDTH);
             Finish(cq0);
         }
         auto t6b = Clock::now();
@@ -2531,6 +2539,7 @@ static float* forward_decode() {
         printf("  GEMV + eltwise + Finish:  %.3f ms\n", t_gemv_eltwise);
         printf("  GEMV data: %.1f MB\n",
                (double)(g_combined_rows * MC::n_embd) * 1.0625 / 1e6);
+
         fflush(stdout);
     }
 
@@ -2571,10 +2580,22 @@ static float* forward_decode() {
                 });
             }
 
-            // On-device rmsnorm + GEMV trace (eliminates host rmsnorm + norm write)
-            // Disabled traces for debugging: run norm+GEMV directly each time
-            norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
-                            g_combined_rows, MC::n_embd);
+            // On-device rmsnorm + GEMV (traced after first use)
+            if (!g_norm_matmul_traces_valid[layer]) {
+                // First call: execute normally (creates cached workloads)
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
+                                g_combined_rows, MC::n_embd);
+                Finish(cq0);
+                // Second call: capture trace
+                auto tid = g_mesh->begin_mesh_trace(0);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.ssm_w_combined_buf[ssm_idx],
+                                g_combined_rows, MC::n_embd);
+                g_mesh->end_mesh_trace(0, tid);
+                g_norm_matmul_traces[layer] = tid;
+                g_norm_matmul_traces_valid[layer] = true;
+            } else {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+            }
 
             auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
@@ -2730,22 +2751,62 @@ static float* forward_decode() {
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw).count();
 
             auto t2 = Clock::now();
-            // Disabled traces for debugging: run FFN chain directly
             if (g_mesh1) {
-                outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                // TP FFN: chip 0 + chip 1 traced independently
+                if (!g_ffn_chain_traces_valid[layer]) {
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    Finish(cq0);
+                    auto tid0 = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    g_mesh->end_mesh_trace(0, tid0);
+                    g_ffn_chain_traces[layer] = tid0;
+                    g_ffn_chain_traces_valid[layer] = true;
+                }
+                if (!g_ffn_chain_traces_valid_1[layer]) {
+                    write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
+                    outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf_1[ssm_idx]);
+                    auto& cq1 = g_mesh1->mesh_command_queue();
+                    Finish(cq1);
+                    auto tid1 = g_mesh1->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf_1[ssm_idx]);
+                    g_mesh1->end_mesh_trace(0, tid1);
+                    g_ffn_chain_traces_1[layer] = tid1;
+                    g_ffn_chain_traces_valid_1[layer] = true;
+                }
+                // Replay traces
+                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
+                g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+            } else {
+                if (!g_ffn_chain_traces_valid[layer]) {
+                    outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                           g_wt.post_norm_buf[layer],
                                           g_wt.ssm_ffn_gate_up_buf[ssm_idx],
                                           g_wt.ssm_ffn_down_buf[ssm_idx]);
-                write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
-                outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                                          g_wt.post_norm_buf_1[layer],
-                                          g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
-                                          g_wt.ssm_ffn_down_buf_1[ssm_idx]);
-            } else {
-                outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                                      g_wt.post_norm_buf[layer],
-                                      g_wt.ssm_ffn_gate_up_buf[ssm_idx],
-                                      g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    Finish(cq0);
+                    auto tid = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                          g_wt.post_norm_buf[layer],
+                                          g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                          g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    g_mesh->end_mesh_trace(0, tid);
+                    g_ffn_chain_traces[layer] = tid;
+                    g_ffn_chain_traces_valid[layer] = true;
+                } else {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                }
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
 
@@ -2790,9 +2851,20 @@ static float* forward_decode() {
                 });
             }
 
-            // Traces disabled for debugging — direct dispatch
-            norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
-                            g_qkv_rows, MC::n_embd);
+            // Norm + QKV GEMV (traced after first use)
+            if (!g_norm_matmul_traces_valid[layer]) {
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                g_qkv_rows, MC::n_embd);
+                Finish(cq0);
+                auto tid = g_mesh->begin_mesh_trace(0);
+                norm_matmul_ops(g_wt.attn_norm_buf[layer], g_wt.attn_wqkv_buf[attn_idx],
+                                g_qkv_rows, MC::n_embd);
+                g_mesh->end_mesh_trace(0, tid);
+                g_norm_matmul_traces[layer] = tid;
+                g_norm_matmul_traces_valid[layer] = true;
+            } else {
+                g_mesh->replay_mesh_trace(0, g_norm_matmul_traces[layer], false);
+            }
 
             auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
@@ -2895,25 +2967,61 @@ static float* forward_decode() {
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw2).count();
 
             auto t2 = Clock::now();
-            // Traces disabled for debugging — direct dispatch
             if (g_mesh1) {
-                outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                if (!g_ffn_chain_traces_valid[layer]) {
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    Finish(cq0);
+                    auto tid0 = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    g_mesh->end_mesh_trace(0, tid0);
+                    g_ffn_chain_traces[layer] = tid0;
+                    g_ffn_chain_traces_valid[layer] = true;
+                }
+                if (!g_ffn_chain_traces_valid_1[layer]) {
+                    write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
+                    outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                              g_wt.attn_ffn_down_buf_1[attn_idx]);
+                    auto& cq1 = g_mesh1->mesh_command_queue();
+                    Finish(cq1);
+                    auto tid1 = g_mesh1->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf_1[layer],
+                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                              g_wt.attn_ffn_down_buf_1[attn_idx]);
+                    g_mesh1->end_mesh_trace(0, tid1);
+                    g_ffn_chain_traces_1[layer] = tid1;
+                    g_ffn_chain_traces_valid_1[layer] = true;
+                }
+                // Replay traces
+                g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
+                g_mesh1->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+            } else {
+                if (!g_ffn_chain_traces_valid[layer]) {
+                    outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                           g_wt.post_norm_buf[layer],
                                           g_wt.attn_ffn_gate_up_buf[attn_idx],
                                           g_wt.attn_ffn_down_buf[attn_idx]);
-                int ly = layer;
-                g_chip1_writer.submit([ly, attn_out, attn_idx]{
-                    write_f32_to_chip1_bg(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim);
-                    outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                                              g_wt.post_norm_buf_1[ly],
-                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
-                                              g_wt.attn_ffn_down_buf_1[attn_idx]);
-                });
-            } else {
-                outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                                      g_wt.post_norm_buf[layer],
-                                      g_wt.attn_ffn_gate_up_buf[attn_idx],
-                                      g_wt.attn_ffn_down_buf[attn_idx]);
+                    Finish(cq0);
+                    auto tid = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                          g_wt.post_norm_buf[layer],
+                                          g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                          g_wt.attn_ffn_down_buf[attn_idx]);
+                    g_mesh->end_mesh_trace(0, tid);
+                    g_ffn_chain_traces[layer] = tid;
+                    g_ffn_chain_traces_valid[layer] = true;
+                } else {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                }
             }
             g_time_ffn += std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
 
@@ -2954,9 +3062,25 @@ static float* forward_decode() {
         // Write norm to chip 1 (chip 0 already has it from above)
         write_f32_to_buf(g_norm_dev_buf_1, g_norm_out.data(), MC::n_embd, g_mesh1.get());
 
-        // Traces disabled for debugging — direct dispatch
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
-        dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+        if (!g_lmhead_trace_valid) {
+            // First call: execute + capture traces
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            Finish(cq0);
+            Finish(cq1);
+            auto tid0 = g_mesh->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            g_mesh->end_mesh_trace(0, tid0);
+            auto tid1 = g_mesh1->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            g_mesh1->end_mesh_trace(0, tid1);
+            g_lmhead_trace = tid0;
+            g_lmhead_trace_1 = tid1;
+            g_lmhead_trace_valid = true;
+        } else {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+            g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
+        }
 
         // Read from both chips in parallel (each waits for its chip's GEMV)
         g_chip1_writer.submit([&]{
@@ -2971,9 +3095,19 @@ static float* forward_decode() {
     } else {
         // Single-chip LM head (traced)
         auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
-        // Traces disabled for debugging — direct dispatch
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                      MC::n_vocab, MC::n_embd);
+        if (!g_lmhead_trace_valid) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                          MC::n_vocab, MC::n_embd);
+            Finish(cq0);
+            auto tid = g_mesh->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                          MC::n_vocab, MC::n_embd);
+            g_mesh->end_mesh_trace(0, tid);
+            g_lmhead_trace = tid;
+            g_lmhead_trace_valid = true;
+        } else {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+        }
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
         read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
     }
