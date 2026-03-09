@@ -2761,9 +2761,12 @@ static float* forward_decode() {
 
     // Read hidden from device (waits for last FFN chain) + TP reduction
     if (g_mesh1) {
+        g_chip1_writer.submit([&]{
+            auto& cq1 = g_mesh1->mesh_command_queue();
+            read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
+        });
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
-        auto& cq1 = g_mesh1->mesh_command_queue();
-        read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
+        g_chip1_writer.wait();
         for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
     } else {
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
@@ -2810,9 +2813,12 @@ static float* forward_decode() {
             g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
         }
 
-        // Read from both chips (blocking reads — each waits for its chip's GEMV)
-        EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
+        // Read from both chips in parallel (each waits for its chip's GEMV)
+        g_chip1_writer.submit([&]{
+            EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
+        });
         EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
+        g_chip1_writer.wait();
 
         // Untilize: chip 0 has first M0 rows, chip 1 has next M1 rows
         read_gemv_to_f32(gb_lm0, logits, M0);
