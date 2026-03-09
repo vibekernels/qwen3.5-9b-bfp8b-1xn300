@@ -102,6 +102,10 @@ struct WeightBuffers {
     std::shared_ptr<MeshBuffer> ssm_ffn_down_buf[24];
     std::shared_ptr<MeshBuffer> ssm_out_buf[24];
 
+    // Chip 0: Combined gate+up weight buffers (fused GEMV for FFN)
+    std::shared_ptr<MeshBuffer> ssm_ffn_gate_up_buf[24];
+    std::shared_ptr<MeshBuffer> attn_ffn_gate_up_buf[8];
+
     // LM head
     std::shared_ptr<MeshBuffer> lm_head_buf;
 
@@ -127,6 +131,9 @@ struct WeightBuffers {
     std::shared_ptr<MeshBuffer> attn_ffn_gate_buf_1[8];
     std::shared_ptr<MeshBuffer> attn_ffn_up_buf_1[8];
     std::shared_ptr<MeshBuffer> attn_ffn_down_buf_1[8];
+    // Chip 1: Combined gate+up weight buffers (fused GEMV for FFN)
+    std::shared_ptr<MeshBuffer> ssm_ffn_gate_up_buf_1[24];
+    std::shared_ptr<MeshBuffer> attn_ffn_gate_up_buf_1[8];
     // Chip 1: replicated outproj weights (full copy for independent outproj_resadd)
     std::shared_ptr<MeshBuffer> ssm_out_buf_1[24];
     std::shared_ptr<MeshBuffer> attn_wo_buf_1[8];
@@ -569,6 +576,122 @@ static void dispatch_gemv_resadd(MeshDevice* device,
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)residual_buf->address(), mt_this_core, start_row});
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
+// Cached GEMV with split writer: output tiles below split_tile go to dst0, above go to dst1.
+// Used for fused gate+up GEMV where a single GEMV populates two separate output buffers.
+struct CachedGemvSplitWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t>, CachedGemvSplitWorkload> g_gemv_split_cache;
+
+// Fused gate+up GEMV: y[1,2M] = x[1,K] @ W[2M,K]^T, output split to dst0[M] and dst1[M]
+static void dispatch_gemv_split(MeshDevice* device,
+                                 std::shared_ptr<MeshBuffer> act_buf,
+                                 std::shared_ptr<MeshBuffer> weight_buf,
+                                 std::shared_ptr<MeshBuffer> dst0_buf,
+                                 std::shared_ptr<MeshBuffer> dst1_buf,
+                                 uint32_t M_total, uint32_t K, uint32_t split_M,
+                                 tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uintptr_t)device, (uint32_t)act_buf->address(),
+                               (uint32_t)weight_buf->address(),
+                               (uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address());
+    auto& cached = g_gemv_split_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+
+        uint32_t Kt = K / TILE_WIDTH;
+        uint32_t Mt = M_total / TILE_HEIGHT;
+        uint32_t split_tile = split_M / TILE_HEIGHT;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
+        uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
+
+        Program program = CreateProgram();
+
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+        uint32_t weight_tile_bytes = tile_size(weight_format);
+
+        uint32_t effective_block = 16;
+        uint32_t weight_cb_tiles = effective_block * 2;
+
+        // Activation CB (c_0)
+        CircularBufferConfig cb_act_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_act_cfg);
+
+        // Weight CB (c_1)
+        CircularBufferConfig cb_weight_cfg =
+            CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+                .set_page_size(CBIndex::c_1, weight_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_weight_cfg);
+
+        // Output CB (c_16)
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
+
+        // Reader: same as regular GEMV
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
+        TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute: same as regular GEMV
+        std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), all_cores,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        // Writer: split writer (gate/up to separate buffers)
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*dst0_buf).append_to(writer_ct_args);
+        TensorAccessorArgs(*dst1_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_split.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = dram_workers[b];
+            uint32_t start_row = b * Mt_per_bank;
+            uint32_t mt_this_core = (start_row >= Mt) ? 0 :
+                                    std::min(Mt_per_bank, Mt - start_row);
+
+            SetRuntimeArgs(program, reader_kid, core,
+                           {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
+                            mt_this_core, b});
+            SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address(),
+                            mt_this_core, start_row, split_tile});
         }
 
         cached.workload = MeshWorkload();
@@ -1198,8 +1321,7 @@ static bool g_lmhead_trace_valid = false;
 static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf,
                                    uint32_t outproj_M, uint32_t outproj_K,
                                    std::shared_ptr<MeshBuffer> norm_weight_buf,
-                                   std::shared_ptr<MeshBuffer> gate_weight_buf,
-                                   std::shared_ptr<MeshBuffer> up_weight_buf,
+                                   std::shared_ptr<MeshBuffer> gate_up_weight_buf,
                                    std::shared_ptr<MeshBuffer> down_weight_buf) {
     // 1. Output projection + residual add (fused): hidden += residual @ outproj_weight^T
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
@@ -1210,16 +1332,12 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
     dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
                           g_norm_dev_buf, MC::n_embd, embd_tiles);
 
-    // 3. FFN: gate + up matmuls → SwiGLU (SiLU(gate)*up) → down matmul + residual add
+    // 3. FFN: fused gate+up GEMV → SwiGLU → down matmul + residual add
     auto& fb = get_ffn_buf(g_mesh.get());
 
-    // Gate projection
-    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, gate_weight_buf, fb.gate_buf,
-                  MC::n_ff, MC::n_embd);
-
-    // Up projection
-    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, up_weight_buf, fb.up_buf,
-                  MC::n_ff, MC::n_embd);
+    // Fused gate+up projection (single GEMV, split writer to gate_buf and up_buf)
+    dispatch_gemv_split(g_mesh.get(), g_norm_dev_buf, gate_up_weight_buf,
+                        fb.gate_buf, fb.up_buf, MC::n_ff * 2, MC::n_embd, MC::n_ff);
 
     // SwiGLU: SiLU(gate) * up
     constexpr uint32_t ff_tiles = MC::n_ff / TILE_WIDTH;
@@ -1230,13 +1348,12 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
                          g_hidden_dev_buf, MC::n_embd, MC::n_ff);
 }
 
-// TP FFN chain on chip 0: outproj_resadd → rmsnorm → gate_half → up_half → swiglu → down_half_resadd
+// TP FFN chain on chip 0: outproj_resadd → rmsnorm → fused gate+up → swiglu → down_half_resadd
 static void outproj_ffn_chain_ops_tp0(
     std::shared_ptr<MeshBuffer> outproj_weight_buf,
     uint32_t outproj_M, uint32_t outproj_K,
     std::shared_ptr<MeshBuffer> norm_weight_buf,
-    std::shared_ptr<MeshBuffer> gate_weight_buf,
-    std::shared_ptr<MeshBuffer> up_weight_buf,
+    std::shared_ptr<MeshBuffer> gate_up_weight_buf,
     std::shared_ptr<MeshBuffer> down_weight_buf) {
 
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
@@ -1244,23 +1361,21 @@ static void outproj_ffn_chain_ops_tp0(
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
     dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
                           g_norm_dev_buf, MC::n_embd, embd_tiles);
-    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, gate_weight_buf,
-                  g_tp_ffn_0.gate_buf, n_ff_tp, MC::n_embd);
-    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, up_weight_buf,
-                  g_tp_ffn_0.up_buf, n_ff_tp, MC::n_embd);
+    dispatch_gemv_split(g_mesh.get(), g_norm_dev_buf, gate_up_weight_buf,
+                        g_tp_ffn_0.gate_buf, g_tp_ffn_0.up_buf,
+                        n_ff_tp * 2, MC::n_embd, n_ff_tp);
     dispatch_swiglu(g_mesh.get(), g_tp_ffn_0.gate_buf, g_tp_ffn_0.up_buf,
                     g_tp_ffn_0.act_buf, n_ff_tp_tiles);
     dispatch_gemv_resadd(g_mesh.get(), g_tp_ffn_0.act_buf, down_weight_buf,
                          g_hidden_dev_buf, MC::n_embd, n_ff_tp);
 }
 
-// TP FFN chain on chip 1: outproj_resadd → rmsnorm → gate_half → up_half → swiglu → down_half → partial
+// TP FFN chain on chip 1: outproj_resadd → rmsnorm → fused gate+up → swiglu → down_half → partial
 static void outproj_ffn_chain_ops_tp1(
     std::shared_ptr<MeshBuffer> outproj_weight_buf,
     uint32_t outproj_M, uint32_t outproj_K,
     std::shared_ptr<MeshBuffer> norm_weight_buf,
-    std::shared_ptr<MeshBuffer> gate_weight_buf,
-    std::shared_ptr<MeshBuffer> up_weight_buf,
+    std::shared_ptr<MeshBuffer> gate_up_weight_buf,
     std::shared_ptr<MeshBuffer> down_weight_buf) {
 
     dispatch_gemv_resadd(g_mesh1.get(), g_residual_dev_buf_1, outproj_weight_buf,
@@ -1268,10 +1383,9 @@ static void outproj_ffn_chain_ops_tp1(
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
     dispatch_rmsnorm_fpu(g_mesh1.get(), g_hidden_dev_buf_1, norm_weight_buf,
                           g_norm_dev_buf_1, MC::n_embd, embd_tiles);
-    dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, gate_weight_buf,
-                  g_tp_ffn_1.gate_buf, n_ff_tp, MC::n_embd);
-    dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, up_weight_buf,
-                  g_tp_ffn_1.up_buf, n_ff_tp, MC::n_embd);
+    dispatch_gemv_split(g_mesh1.get(), g_norm_dev_buf_1, gate_up_weight_buf,
+                        g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
+                        n_ff_tp * 2, MC::n_embd, n_ff_tp);
     dispatch_swiglu(g_mesh1.get(), g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
                     g_tp_ffn_1.act_buf, n_ff_tp_tiles);
     // Plain GEMV (not resadd) - output partial sum to dedicated buffer
@@ -1734,20 +1848,27 @@ static void create_weight_tensors() {
                 uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
                 auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
                 // Chip 0: first half of gate/up rows, first half of down cols
-                g_wt.ssm_ffn_gate_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_h0, Mt0_gate * TILE_HEIGHT, MC::n_embd);
-                g_wt.ssm_ffn_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), up_h0, Mt0_up * TILE_HEIGHT, MC::n_embd);
                 g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
                 // Chip 1: second half
-                g_wt.ssm_ffn_gate_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_h1, Mt1_gate * TILE_HEIGHT, MC::n_embd);
-                g_wt.ssm_ffn_up_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), up_h1, Mt1_up * TILE_HEIGHT, MC::n_embd);
                 g_wt.ssm_ffn_down_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
+                // Fused gate+up: concatenate halves for each chip
+                std::vector<uint32_t> gate_up_h0(gate_h0);
+                gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
+                g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
+                    (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
+                std::vector<uint32_t> gate_up_h1(gate_h1);
+                gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
+                g_wt.ssm_ffn_gate_up_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
+                    (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
                 // Replicate outproj on chip 1
                 g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
                 g_wt.ssm_out_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_out, MC::n_embd, MC::ssm_d_inner);
             } else {
                 // No TP: full FFN weights on chip 0
-                g_wt.ssm_ffn_gate_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
-                g_wt.ssm_ffn_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
+                // Fused gate+up: concatenate gate and up
+                std::vector<uint32_t> gate_up(p_gate);
+                gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
+                g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
                 g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
                 g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
             }
@@ -1789,18 +1910,25 @@ static void create_weight_tensors() {
                 auto [up_h0, up_h1] = split_packed_m(p_up, Mt_ff, Kt_embd, Mt0_up, Mt1_up);
                 uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
                 auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
-                g_wt.attn_ffn_gate_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_h0, Mt0_gate * TILE_HEIGHT, MC::n_embd);
-                g_wt.attn_ffn_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), up_h0, Mt0_up * TILE_HEIGHT, MC::n_embd);
                 g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
-                g_wt.attn_ffn_gate_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_h1, Mt1_gate * TILE_HEIGHT, MC::n_embd);
-                g_wt.attn_ffn_up_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), up_h1, Mt1_up * TILE_HEIGHT, MC::n_embd);
                 g_wt.attn_ffn_down_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
+                // Fused gate+up: concatenate halves for each chip
+                std::vector<uint32_t> gate_up_h0(gate_h0);
+                gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
+                g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
+                    (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
+                std::vector<uint32_t> gate_up_h1(gate_h1);
+                gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
+                g_wt.attn_ffn_gate_up_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
+                    (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
                 // Replicate Wo on chip 1
                 g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
                 g_wt.attn_wo_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
             } else {
-                g_wt.attn_ffn_gate_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
-                g_wt.attn_ffn_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
+                // Fused gate+up
+                std::vector<uint32_t> gate_up(p_gate);
+                gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
+                g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
                 g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
                 g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
             }
@@ -2155,13 +2283,13 @@ static float* forward_decode() {
         if (!g_ffn_chain_traces_valid[0]) {
             outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
                                   g_wt.post_norm_buf[0],
-                                  g_wt.ssm_ffn_gate_buf[0], g_wt.ssm_ffn_up_buf[0],
+                                  g_wt.ssm_ffn_gate_up_buf[0],
                                   g_wt.ssm_ffn_down_buf[0]);
             Finish(cq0);
             auto tid = g_mesh->begin_mesh_trace(0);
             outproj_ffn_chain_ops(g_wt.ssm_out_buf[0], MC::n_embd, MC::ssm_d_inner,
                                   g_wt.post_norm_buf[0],
-                                  g_wt.ssm_ffn_gate_buf[0], g_wt.ssm_ffn_up_buf[0],
+                                  g_wt.ssm_ffn_gate_up_buf[0],
                                   g_wt.ssm_ffn_down_buf[0]);
             g_mesh->end_mesh_trace(0, tid);
             g_ffn_chain_traces[0] = tid;
@@ -2475,21 +2603,21 @@ static float* forward_decode() {
                     // Warmup chip 0
                     outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf[layer],
-                                              g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
                                               g_wt.ssm_ffn_down_buf[ssm_idx]);
                     Finish(cq0);
                     // Chip 1 warmup: write residual then warmup ops (blocking, first time only)
                     write_f32_to_buf(g_residual_dev_buf_1, ssm_proj_in, MC::ssm_d_inner, g_mesh1.get());
                     outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf_1[layer],
-                                              g_wt.ssm_ffn_gate_buf_1[ssm_idx], g_wt.ssm_ffn_up_buf_1[ssm_idx],
+                                              g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
                                               g_wt.ssm_ffn_down_buf_1[ssm_idx]);
                     Finish(cq1);
                     // Capture chip 0 trace
                     auto tid0 = g_mesh->begin_mesh_trace(0);
                     outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf[layer],
-                                              g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
                                               g_wt.ssm_ffn_down_buf[ssm_idx]);
                     g_mesh->end_mesh_trace(0, tid0);
                     g_ffn_chain_traces[layer] = tid0;
@@ -2497,7 +2625,7 @@ static float* forward_decode() {
                     auto tid1 = g_mesh1->begin_mesh_trace(0);
                     outproj_ffn_chain_ops_tp1(g_wt.ssm_out_buf_1[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                               g_wt.post_norm_buf_1[layer],
-                                              g_wt.ssm_ffn_gate_buf_1[ssm_idx], g_wt.ssm_ffn_up_buf_1[ssm_idx],
+                                              g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
                                               g_wt.ssm_ffn_down_buf_1[ssm_idx]);
                     g_mesh1->end_mesh_trace(0, tid1);
                     g_ffn_chain_traces_1[layer] = tid1;
@@ -2518,13 +2646,13 @@ static float* forward_decode() {
                 if (!g_ffn_chain_traces_valid[layer]) {
                     outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                           g_wt.post_norm_buf[layer],
-                                          g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                          g_wt.ssm_ffn_gate_up_buf[ssm_idx],
                                           g_wt.ssm_ffn_down_buf[ssm_idx]);
                     Finish(cq0);
                     auto tid = g_mesh->begin_mesh_trace(0);
                     outproj_ffn_chain_ops(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
                                           g_wt.post_norm_buf[layer],
-                                          g_wt.ssm_ffn_gate_buf[ssm_idx], g_wt.ssm_ffn_up_buf[ssm_idx],
+                                          g_wt.ssm_ffn_gate_up_buf[ssm_idx],
                                           g_wt.ssm_ffn_down_buf[ssm_idx]);
                     g_mesh->end_mesh_trace(0, tid);
                     g_ffn_chain_traces[layer] = tid;
@@ -2695,27 +2823,27 @@ static float* forward_decode() {
                 if (!g_ffn_chain_traces_valid[layer]) {
                     outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf[layer],
-                                              g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
                                               g_wt.attn_ffn_down_buf[attn_idx]);
                     Finish(cq0);
                     // Chip 1 warmup: write residual then warmup ops (blocking, first time only)
                     write_f32_to_buf(g_residual_dev_buf_1, attn_out, MC::n_head * MC::head_dim, g_mesh1.get());
                     outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf_1[layer],
-                                              g_wt.attn_ffn_gate_buf_1[attn_idx], g_wt.attn_ffn_up_buf_1[attn_idx],
+                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
                                               g_wt.attn_ffn_down_buf_1[attn_idx]);
                     Finish(cq1);
                     auto tid0 = g_mesh->begin_mesh_trace(0);
                     outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf[layer],
-                                              g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
                                               g_wt.attn_ffn_down_buf[attn_idx]);
                     g_mesh->end_mesh_trace(0, tid0);
                     g_ffn_chain_traces[layer] = tid0;
                     auto tid1 = g_mesh1->begin_mesh_trace(0);
                     outproj_ffn_chain_ops_tp1(g_wt.attn_wo_buf_1[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                               g_wt.post_norm_buf_1[layer],
-                                              g_wt.attn_ffn_gate_buf_1[attn_idx], g_wt.attn_ffn_up_buf_1[attn_idx],
+                                              g_wt.attn_ffn_gate_up_buf_1[attn_idx],
                                               g_wt.attn_ffn_down_buf_1[attn_idx]);
                     g_mesh1->end_mesh_trace(0, tid1);
                     g_ffn_chain_traces_1[layer] = tid1;
@@ -2735,13 +2863,13 @@ static float* forward_decode() {
                 if (!g_ffn_chain_traces_valid[layer]) {
                     outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                           g_wt.post_norm_buf[layer],
-                                          g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                          g_wt.attn_ffn_gate_up_buf[attn_idx],
                                           g_wt.attn_ffn_down_buf[attn_idx]);
                     Finish(cq0);
                     auto tid = g_mesh->begin_mesh_trace(0);
                     outproj_ffn_chain_ops(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
                                           g_wt.post_norm_buf[layer],
-                                          g_wt.attn_ffn_gate_buf[attn_idx], g_wt.attn_ffn_up_buf[attn_idx],
+                                          g_wt.attn_ffn_gate_up_buf[attn_idx],
                                           g_wt.attn_ffn_down_buf[attn_idx]);
                     g_mesh->end_mesh_trace(0, tid);
                     g_ffn_chain_traces[layer] = tid;
@@ -3088,6 +3216,7 @@ void shutdown() {
     g_eltwise_cache.clear();
     g_gemv_cache.clear();
     g_gemv_resadd_cache.clear();
+    g_gemv_split_cache.clear();
     g_fused_norm_gemv_cache.clear();
     g_rmsnorm_cache.clear();
     g_mc_rmsnorm_cache.clear();
