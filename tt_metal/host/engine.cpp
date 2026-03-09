@@ -57,6 +57,7 @@ static std::shared_ptr<MeshDevice> g_mesh2;   // 2-chip parent mesh (1×2)
 static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
+static bool g_verbose = true;  // set false via QUIET=1 env var
 static int g_max_ctx = 0;
 static int g_pos = 0;
 
@@ -3114,7 +3115,7 @@ static float* forward_decode() {
     g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
 
     g_decode_count++;
-    if (g_decode_count % 10 == 0) {
+    if (g_verbose && g_decode_count % 10 == 0) {
         int dc = g_decode_count;
         printf("  [profile @%d] norm_mm=%.0f outproj=%.0f ffn=%.0f host=%.0f reswr=%.0f lmhead=%.0f ms/tok\n",
                dc, g_time_norm_mm / dc, g_time_outproj / dc, g_time_ffn / dc,
@@ -3135,6 +3136,7 @@ static float* forward_decode() {
 // ============================================================================
 
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
+    if (getenv("QUIET")) g_verbose = false;
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
     // Open both N300 chips as a 1×2 MeshDevice, then create submeshes
@@ -3237,12 +3239,22 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     int total_generated = 0;
     int next_token = -1;
 
+    // Truncate prompt to fit context window (keep last tokens, leave room for generation)
+    std::vector<int> tokens = prompt_tokens;
+    int max_prompt = g_max_ctx - std::min(max_tokens, g_max_ctx / 2);
+    if (max_prompt < 1) max_prompt = 1;
+    if ((int)tokens.size() > max_prompt) {
+        printf("  [truncating prompt from %zu to %d tokens to fit ctx=%d]\n",
+               tokens.size(), max_prompt, g_max_ctx);
+        tokens.erase(tokens.begin(), tokens.begin() + ((int)tokens.size() - max_prompt));
+    }
+
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // Process all prompt tokens
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        int token = prompt_tokens[i];
-        printf("  [prefill token %d/%d: %d]\n", i + 1, (int)prompt_tokens.size(), token);
+    for (int i = 0; i < (int)tokens.size(); i++) {
+        int token = tokens[i];
+        if (g_verbose) printf("  [prefill token %d/%d: %d]\n", i + 1, (int)tokens.size(), token);
 
         // Bulk bf16→f32 embedding lookup using raw bit ops
         const uint16_t* emb = g_model.tok_embd_host.data() + (size_t)token * MC::n_embd;
@@ -3254,7 +3266,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         g_pos++;
 
         // After last prompt token, sample first output
-        if (i == (int)prompt_tokens.size() - 1) {
+        if (i == (int)tokens.size() - 1) {
             float max_l = -FLT_MAX;
             for (int v = 0; v < MC::n_vocab; v++) {
                 if (logits[v] > max_l) { max_l = logits[v]; next_token = v; }
@@ -3265,7 +3277,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
     printf("  [prefill: %.1f ms for %zu tokens (%.1f ms/tok)]\n",
-           prefill_ms, prompt_tokens.size(), prefill_ms / prompt_tokens.size());
+           prefill_ms, tokens.size(), prefill_ms / tokens.size());
 
     // Generate tokens
     while (total_generated < max_tokens) {
@@ -3295,7 +3307,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double tok_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        printf("  [decode: %.0f ms]\n", tok_ms);
+        if (g_verbose) printf("  [decode: %.0f ms]\n", tok_ms);
 
         float max_l = -FLT_MAX;
         int best = 0;
