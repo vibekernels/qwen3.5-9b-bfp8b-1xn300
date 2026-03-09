@@ -4,28 +4,31 @@ The point of this project is to write a Tenstorrent accelerator kernel. ALL comp
 
 # Project structure
 
-- `tt_metal/host/engine.cpp` — inference engine (~3400 lines): forward pass, `generate()`, `load_model_and_tokenizer()`
-- `tt_metal/host/engine.h` — public API: `generate()`, `load_model_and_tokenizer()`, `reset_state()`, `shutdown()`, `get_tokenizer()`
-- `tt_metal/host/gguf_loader.{h,cpp}` — GGUF weight loading into device DRAM MeshBuffers
-- `tt_metal/host/model_config.h` — model hyperparameters and tile dimensions
-- `tt_metal/kernels/compute/` — Tensix compute kernels: `gemv.cpp`, `rmsnorm.cpp`, `eltwise_binary.cpp`, `swiglu.cpp`
-- `tt_metal/kernels/dataflow/` — data movement kernels: `reader_gemv_dram_sharded.cpp`, `writer_gemv.cpp`, `writer_gemv_split.cpp`, `writer_gemv_resadd.cpp`, `reader_binary_tiles_multicore.cpp`
-- `tt_metal/tests/` — test suite: `test_forward.cpp`, `test_device.cpp`, `test_matmul.cpp`, `test_load_weights.cpp`, `test_dram_bw.cpp`, `test_mesh_overhead.cpp`
-- `tt_metal/CMakeLists.txt` — CMake build system
+- `src/engine.cpp` — inference engine: forward pass, `generate()`, `load_model_and_tokenizer()`
+- `src/engine.h` — public API: `generate()`, `load_model_and_tokenizer()`, `reset_state()`, `shutdown()`, `get_tokenizer()`
+- `src/gguf_loader.{h,cpp}` — GGUF weight loading into device DRAM MeshBuffers
+- `src/model_config.h` — model hyperparameters and tile dimensions
 - `src/tokenizer.{h,cpp}` — BPE tokenizer (GPT-2 byte-level)
 - `src/download.{h,cpp}` — HuggingFace model download
+- `kernels/compute/` — Tensix compute kernels (gemv, rmsnorm, swiglu, etc.)
+- `kernels/dataflow/` — data movement kernels (readers/writers)
+- `tests/` — test suite (test_inference.cpp, test_forward.cpp, benchmarks)
+- `CMakeLists.txt` — CMake build system (root level)
 
 ## Build & test
 
 ```sh
-cd tt_metal && mkdir -p build && cd build
-cmake .. -DTT_METAL_BUILD=/home/ubuntu/tt-metal/build_Release -DCMAKE_CXX_COMPILER=clang++-20
-make -j$(nproc)
+make -j$(nproc)        # build everything
+make test              # run integration tests (uses sudo internally)
+make clean             # remove build artifacts
 ```
 
-## Test inference
+Environment variables:
+- `TT_METAL_HOME` — tt-metal source tree (default: `/home/ubuntu/tt-metal`)
+- `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
+- `MODEL_PATH` — path to .gguf model file
 
-Requires `sudo` and `TT_METAL_RUNTIME_ROOT`:
+## Test inference
 
 ```sh
 sudo TT_METAL_RUNTIME_ROOT=/home/ubuntu/tt-metal \

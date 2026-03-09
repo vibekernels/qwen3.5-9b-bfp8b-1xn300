@@ -19,7 +19,7 @@ using namespace tt::tt_metal::distributed;
 using Clock = std::chrono::high_resolution_clock;
 
 static std::string kernel_path(const char* name) {
-    return std::string("/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/tests/kernels/") + name;
+    return std::string("/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tests/kernels/") + name;
 }
 
 int main() {
@@ -328,7 +328,7 @@ int main() {
                 std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, block};
                 TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
                 auto reader_kid = CreateKernel(program3,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/reader_gemv_dram_sharded.cpp",
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/reader_gemv_dram_sharded.cpp",
                     all_cores3,
                     DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                                        .noc = NOC::RISCV_1_default,
@@ -337,7 +337,7 @@ int main() {
                 // Compute kernel
                 std::vector<uint32_t> compute_ct_args = {Kt, block};
                 auto compute_kid = CreateKernel(program3,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/compute/gemv.cpp",
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/compute/gemv.cpp",
                     all_cores3,
                     ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
 
@@ -345,7 +345,7 @@ int main() {
                 std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
                 TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
                 auto writer_kid = CreateKernel(program3,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/writer_gemv_multicore.cpp",
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/writer_gemv_multicore.cpp",
                     all_cores3,
                     DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                        .noc = NOC::RISCV_0_default,
@@ -445,16 +445,16 @@ int main() {
             std::vector<uint32_t> rca = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, 16u};
             TensorAccessorArgs(*act_buf4).append_to(rca);
             auto rk = CreateKernel(prog,
-                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/reader_gemv_dram_sharded.cpp", ac,
+                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/reader_gemv_dram_sharded.cpp", ac,
                 DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                                    .noc = NOC::RISCV_1_default, .compile_args = rca});
             auto ck = CreateKernel(prog,
-                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/compute/gemv.cpp", ac,
+                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/compute/gemv.cpp", ac,
                 ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = {Kt, 16u}});
             std::vector<uint32_t> wca = {(uint32_t)CBIndex::c_16};
             TensorAccessorArgs(*out_buf4).append_to(wca);
             auto wk = CreateKernel(prog,
-                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/writer_gemv_multicore.cpp", ac,
+                "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/writer_gemv_multicore.cpp", ac,
                 DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                    .noc = NOC::RISCV_0_default, .compile_args = wca});
             for (uint32_t b = 0; b < num_banks; b++) {
@@ -689,16 +689,16 @@ int main() {
                 std::vector<uint32_t> rca = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, ssm_Kt, 16u};
                 TensorAccessorArgs(*ssm_act).append_to(rca);
                 auto rk = CreateKernel(prog,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/reader_gemv_dram_sharded.cpp", ac,
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/reader_gemv_dram_sharded.cpp", ac,
                     DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
                                        .noc = NOC::RISCV_1_default, .compile_args = rca});
                 auto ck = CreateKernel(prog,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/compute/gemv.cpp", ac,
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/compute/gemv.cpp", ac,
                     ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = {ssm_Kt, 16u}});
                 std::vector<uint32_t> wca = {(uint32_t)CBIndex::c_16};
                 TensorAccessorArgs(*ssm_out).append_to(wca);
                 auto wk = CreateKernel(prog,
-                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/tt_metal/kernels/dataflow/writer_gemv_multicore.cpp", ac,
+                    "/home/ubuntu/qwen3.5-9b-bf16-1xn300d/kernels/dataflow/writer_gemv_multicore.cpp", ac,
                     DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                        .noc = NOC::RISCV_0_default, .compile_args = wca});
 

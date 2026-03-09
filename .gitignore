@@ -1,14 +1,14 @@
 # Build artifacts
 build/
-tt_metal/build/
 generated/
-tt_metal/generated/
 
 # Model data
 data/
 models/
-tt_metal/models
 *.gguf
+
+# Legacy tt_metal layout (may still have local artifacts)
+tt_metal/
 
 # Editor
 *.swp
