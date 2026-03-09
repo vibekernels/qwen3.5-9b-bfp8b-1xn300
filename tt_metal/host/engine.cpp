@@ -15,6 +15,7 @@
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/distributed.hpp>
+#include <tt-metalium/mesh_config.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/buffer_distribution_spec.hpp>
@@ -46,7 +47,9 @@ using MC = ModelConfig;
 // ============================================================================
 // Global state
 // ============================================================================
-static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: all weights (layers + LM head)
+static std::shared_ptr<MeshDevice> g_mesh;    // primary mesh for all current ops (1-chip submesh of g_mesh2)
+static std::shared_ptr<MeshDevice> g_mesh1;   // chip 1 submesh (for future TP)
+static std::shared_ptr<MeshDevice> g_mesh2;   // 2-chip parent mesh (1×2)
 static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
@@ -55,7 +58,9 @@ static int g_pos = 0;
 
 // DRAM bank topology for sharded GEMV
 static uint32_t g_num_dram_banks = 0;
-static std::vector<CoreCoord> g_dram_workers;  // optimal Tensix worker per DRAM bank
+static std::vector<CoreCoord> g_dram_workers;  // optimal Tensix worker per DRAM bank (chip 0)
+static uint32_t g_num_dram_banks_1 = 0;
+static std::vector<CoreCoord> g_dram_workers_1;  // optimal Tensix worker per DRAM bank (chip 1)
 
 // Host-side f32 hidden state
 static std::vector<float> g_hidden_f32(MC::n_embd);
@@ -101,6 +106,31 @@ struct WeightBuffers {
     std::shared_ptr<MeshBuffer> post_norm_buf[32];
     std::shared_ptr<MeshBuffer> output_norm_buf;
 
+    // Chip 1: pre-layer GEMV weight halves (column-parallel, bottom M/2 rows)
+    std::shared_ptr<MeshBuffer> ssm_w_combined_buf_1[24];
+    std::shared_ptr<MeshBuffer> attn_wqkv_buf_1[8];
+    std::shared_ptr<MeshBuffer> lm_head_buf_1;
+
+    // Split dimensions (tile counts for each half)
+    uint32_t ssm_combined_Mt0[24], ssm_combined_Mt1[24];  // tile rows per chip
+    uint32_t attn_qkv_Mt0[8], attn_qkv_Mt1[8];
+    uint32_t lm_head_Mt0, lm_head_Mt1;
+
+    // Chip 1: tensor-parallel FFN weight halves (second half of gate/up rows, second half of down cols)
+    std::shared_ptr<MeshBuffer> ssm_ffn_gate_buf_1[24];
+    std::shared_ptr<MeshBuffer> ssm_ffn_up_buf_1[24];
+    std::shared_ptr<MeshBuffer> ssm_ffn_down_buf_1[24];
+    std::shared_ptr<MeshBuffer> attn_ffn_gate_buf_1[8];
+    std::shared_ptr<MeshBuffer> attn_ffn_up_buf_1[8];
+    std::shared_ptr<MeshBuffer> attn_ffn_down_buf_1[8];
+    // Chip 1: replicated outproj weights (full copy for independent outproj_resadd)
+    std::shared_ptr<MeshBuffer> ssm_out_buf_1[24];
+    std::shared_ptr<MeshBuffer> attn_wo_buf_1[8];
+    // Chip 1: norm weights for FFN chain (post_norm for rmsnorm_fpu)
+    std::shared_ptr<MeshBuffer> post_norm_buf_1[32];
+    // Chip 1: pre-layer norm weights
+    std::shared_ptr<MeshBuffer> attn_norm_buf_1[32];
+
 };
 static WeightBuffers g_wt;
 
@@ -109,6 +139,13 @@ static std::shared_ptr<MeshBuffer> g_hidden_dev_buf;
 static std::shared_ptr<MeshBuffer> g_residual_dev_buf;
 // Temp buffer for matmul input after rms_norm (on device)
 static std::shared_ptr<MeshBuffer> g_norm_dev_buf;
+
+// Chip 1 persistent device buffers
+static std::shared_ptr<MeshBuffer> g_hidden_dev_buf_1;
+static std::shared_ptr<MeshBuffer> g_residual_dev_buf_1;
+static std::shared_ptr<MeshBuffer> g_norm_dev_buf_1;
+static std::shared_ptr<MeshBuffer> g_partial_down_buf;     // chip 0 partial down output
+static std::shared_ptr<MeshBuffer> g_partial_down_buf_1;   // chip 1 partial down output
 
 // ============================================================================
 // Pre-allocated device buffers for fast GEMV (avoids per-call alloc/dealloc)
@@ -126,6 +163,10 @@ struct GemvBuf {
 // Map from (device_ptr, K, M) -> pre-allocated buffers
 static std::map<std::tuple<MeshDevice*, uint32_t, uint32_t>, GemvBuf> g_gemv_bufs;
 
+// Device-aware DRAM bank topology lookup (forward declarations)
+static uint32_t get_num_dram_banks(MeshDevice* device);
+static const std::vector<CoreCoord>& get_dram_workers(MeshDevice* device);
+
 static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
     auto key = std::make_tuple(device, K, M);
     auto it = g_gemv_bufs.find(key);
@@ -137,7 +178,7 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
     buf.K_padded = ((K + TW - 1) / TW) * TW;
     // Pad M to next multiple of num_dram_banks for DRAM-sharded dispatch
     uint32_t Mt_raw = (M + TH - 1) / TH;
-    uint32_t nbanks = (g_num_dram_banks > 0) ? g_num_dram_banks : 12;
+    uint32_t nbanks = (get_num_dram_banks(device) > 0) ? get_num_dram_banks(device) : 12;
     uint32_t Mt_padded = ((Mt_raw + nbanks - 1) / nbanks) * nbanks;
     buf.M_padded = Mt_padded * TH;
 
@@ -185,6 +226,14 @@ static std::vector<uint16_t> g_bf16_scratch(MC::n_vocab_padded);
 // ============================================================================
 static std::string kernel_path(const char* rel) {
     return std::string(KERNEL_DIR) + "/" + rel;
+}
+
+// Device-aware DRAM bank topology lookup
+static uint32_t get_num_dram_banks(MeshDevice* device) {
+    return (device == g_mesh.get()) ? g_num_dram_banks : g_num_dram_banks_1;
+}
+static const std::vector<CoreCoord>& get_dram_workers(MeshDevice* device) {
+    return (device == g_mesh.get()) ? g_dram_workers : g_dram_workers_1;
 }
 
 // Cached eltwise binary workload: created once, reused across calls (trace-compatible).
@@ -297,13 +346,14 @@ static void dispatch_gemv(MeshDevice* device,
 
         uint32_t Kt = K / TILE_WIDTH;
         uint32_t Mt = M / TILE_HEIGHT;
-        uint32_t num_banks = g_num_dram_banks;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
         uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
 
         // Build CoreRangeSet from optimal DRAM workers (non-rectangular)
         std::vector<CoreRange> core_ranges;
         for (uint32_t b = 0; b < num_banks; b++) {
-            auto& c = g_dram_workers[b];
+            auto& c = dram_workers[b];
             core_ranges.push_back(CoreRange(c, c));
         }
         CoreRangeSet all_cores(core_ranges);
@@ -363,7 +413,7 @@ static void dispatch_gemv(MeshDevice* device,
 
         // Set per-core runtime args (one core per DRAM bank)
         for (uint32_t b = 0; b < num_banks; b++) {
-            CoreCoord core = g_dram_workers[b];
+            CoreCoord core = dram_workers[b];
             uint32_t start_row = b * Mt_per_bank;
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
@@ -418,12 +468,13 @@ static void dispatch_gemv_resadd(MeshDevice* device,
 
         uint32_t Kt = K / TILE_WIDTH;
         uint32_t Mt = M / TILE_HEIGHT;
-        uint32_t num_banks = g_num_dram_banks;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
         uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
 
         std::vector<CoreRange> core_ranges;
         for (uint32_t b = 0; b < num_banks; b++) {
-            auto& c = g_dram_workers[b];
+            auto& c = dram_workers[b];
             core_ranges.push_back(CoreRange(c, c));
         }
         CoreRangeSet all_cores(core_ranges);
@@ -487,7 +538,7 @@ static void dispatch_gemv_resadd(MeshDevice* device,
                                .compile_args = writer_ct_args});
 
         for (uint32_t b = 0; b < num_banks; b++) {
-            CoreCoord core = g_dram_workers[b];
+            CoreCoord core = dram_workers[b];
             uint32_t start_row = b * Mt_per_bank;
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
@@ -541,12 +592,13 @@ static void dispatch_gemv_fused_norm(MeshDevice* device,
 
         uint32_t Kt = K / TILE_WIDTH;
         uint32_t Mt = M / TILE_HEIGHT;
-        uint32_t num_banks = g_num_dram_banks;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
         uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
 
         std::vector<CoreRange> core_ranges;
         for (uint32_t b = 0; b < num_banks; b++) {
-            auto& c = g_dram_workers[b];
+            auto& c = dram_workers[b];
             core_ranges.push_back(CoreRange(c, c));
         }
         CoreRangeSet all_cores(core_ranges);
@@ -614,7 +666,7 @@ static void dispatch_gemv_fused_norm(MeshDevice* device,
                                .compile_args = writer_ct_args});
 
         for (uint32_t b = 0; b < num_banks; b++) {
-            CoreCoord core = g_dram_workers[b];
+            CoreCoord core = dram_workers[b];
             uint32_t start_row = b * Mt_per_bank;
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
@@ -662,12 +714,13 @@ static void dispatch_swiglu(MeshDevice* device,
         MeshCoordinateRange dev_range(device->shape());
         Program program = CreateProgram();
 
-        uint32_t num_banks = g_num_dram_banks;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
         uint32_t tiles_per_bank = (n_tiles + num_banks - 1) / num_banks;
 
         std::vector<CoreRange> core_ranges;
         for (uint32_t b = 0; b < num_banks; b++) {
-            auto& c = g_dram_workers[b];
+            auto& c = dram_workers[b];
             core_ranges.push_back(CoreRange(c, c));
         }
         CoreRangeSet all_cores(core_ranges);
@@ -722,7 +775,7 @@ static void dispatch_swiglu(MeshDevice* device,
                                .compile_args = writer_ct_args});
 
         for (uint32_t b = 0; b < num_banks; b++) {
-            CoreCoord core = g_dram_workers[b];
+            CoreCoord core = dram_workers[b];
             uint32_t start_tile = b * tiles_per_bank;
             uint32_t my_tiles = (start_tile >= n_tiles) ? 0 :
                                 std::min(tiles_per_bank, n_tiles - start_tile);
@@ -829,12 +882,13 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
     if (!cached.valid) {
         MeshCoordinateRange dev_range(device->shape());
         Program program = CreateProgram();
-        uint32_t num_banks = g_num_dram_banks;
+        uint32_t num_banks = get_num_dram_banks(device);
+        const auto& dram_workers = get_dram_workers(device);
 
         // Build CoreRangeSet from DRAM workers
         std::vector<CoreRange> core_ranges;
         for (uint32_t b = 0; b < num_banks; b++) {
-            auto& c = g_dram_workers[b];
+            auto& c = dram_workers[b];
             core_ranges.push_back(CoreRange(c, c));
         }
         CoreRangeSet all_cores(core_ranges);
@@ -880,17 +934,8 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
         auto* dev0 = device->get_device(MeshCoordinate(0, 0));
         std::vector<CoreCoord> noc_coords(num_banks);
         for (uint32_t b = 0; b < num_banks; b++) {
-            noc_coords[b] = dev0->worker_core_from_logical_core(g_dram_workers[b]);
+            noc_coords[b] = dev0->worker_core_from_logical_core(dram_workers[b]);
         }
-
-        // Use a small L1 region for scratch (sem addresses + data)
-        // We'll use the memory right after sem1 for scratch data
-        // Actually, use a fixed offset in the semaphore region
-        // The scratch addr needs to be the same on all cores and known at dispatch time.
-        // We'll use sem1_addr + 16 (L1 aligned) as scratch base.
-        // On Wormhole, semaphore base is at a fixed L1 address.
-        // We need at least num_banks * 4 bytes for partials on core 0.
-        // Use a CB (c_2) for scratch space instead.
 
         // CB c_2: scratch (1 tile = 1024 bytes, plenty for 12 floats + norm_factor)
         CircularBufferConfig cb_scratch_cfg =
@@ -900,7 +945,7 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
 
         // Set per-core runtime args
         for (uint32_t b = 0; b < num_banks; b++) {
-            CoreCoord core = g_dram_workers[b];
+            CoreCoord core = dram_workers[b];
 
             // Common args: [in_addr, weight_addr, out_addr, n_elements, core_id,
             //               sem0_addr, sem1_addr, scratch_addr,
@@ -957,7 +1002,7 @@ static void dispatch_rmsnorm_fpu(MeshDevice* device,
         Program program = CreateProgram();
 
         // Use a single worker core (first DRAM worker)
-        auto core = g_dram_workers[0];
+        auto core = get_dram_workers(device)[0];
         CoreRange single_core(core, core);
         CoreRangeSet core_set({single_core});
 
@@ -1116,6 +1161,7 @@ static void norm_lmhead_ops() {
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb.out_buf, MC::n_vocab, MC::n_embd);
 }
 static MeshTraceId g_lmhead_trace;
+static MeshTraceId g_lmhead_trace_1;  // chip 1 LM head trace
 static bool g_lmhead_trace_valid = false;
 
 // Run outproj matmul + residual add + norm + FFN chain + residual add on device.
@@ -1130,7 +1176,7 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
                          g_hidden_dev_buf, outproj_M, outproj_K);
 
-    // 2. RMSNorm (single-core FPU — much faster than software-float multicore)
+    // 2. RMSNorm (single-core FPU)
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
     dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
                           g_norm_dev_buf, MC::n_embd, embd_tiles);
@@ -1158,10 +1204,10 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
 // Separate tiled host buffer for write_f32_to_buf (declared before use)
 static std::vector<bfloat16> g_write_host_tiled;
 
-// Write f32 vector to a device MeshBuffer (tilize + enqueue on chip 0)
+// Write f32 vector to a device MeshBuffer (tilize + enqueue)
 static void write_f32_to_buf(std::shared_ptr<MeshBuffer> buf, const float* data,
-                              uint32_t len) {
-    auto& cq = g_mesh->mesh_command_queue();
+                              uint32_t len, MeshDevice* device = nullptr) {
+    auto& cq = (device ? device : g_mesh.get())->mesh_command_queue();
     uint32_t padded = ((len + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
     size_t needed = (size_t)(padded / TILE_WIDTH) * TILE_HEIGHT * TILE_WIDTH;
     if (g_write_host_tiled.size() < needed)
@@ -1299,6 +1345,42 @@ static std::vector<uint32_t> pack_bf16_as_bfp8b(const uint16_t* bf16_data, uint3
     return pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(span, /*row_major_input=*/true, /*is_exp_a=*/false);
 }
 
+// Split packed BFP8_B tiles by M dimension (row split).
+// Layout: tiles are row-major [Mt × Kt], so first Mt0*Kt tiles go to half0.
+// Returns {half0, half1} and sets Mt0_out, Mt1_out to the tile counts.
+static std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
+split_packed_m(const std::vector<uint32_t>& packed, uint32_t Mt, uint32_t Kt,
+               uint32_t& Mt0_out, uint32_t& Mt1_out) {
+    constexpr uint32_t wpt = BFLOAT8_B_TILE_HW / sizeof(uint32_t);  // 272 words per tile
+    uint32_t Mt0 = (Mt + 1) / 2;  // ceil
+    uint32_t Mt1 = Mt - Mt0;
+    Mt0_out = Mt0;
+    Mt1_out = Mt1;
+    uint32_t words0 = Mt0 * Kt * wpt;
+    uint32_t words1 = Mt1 * Kt * wpt;
+    return {
+        std::vector<uint32_t>(packed.begin(), packed.begin() + words0),
+        std::vector<uint32_t>(packed.begin() + words0, packed.begin() + words0 + words1)
+    };
+}
+
+// Split packed BFP8_B tiles by K dimension (column split): first K/2 cols vs second K/2 cols
+// Tiles in row [m]: tile(m,0)..tile(m,Kt-1). Split at Kt/2.
+static std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
+split_packed_k(const std::vector<uint32_t>& packed, uint32_t Mt, uint32_t Kt) {
+    constexpr uint32_t wpt = BFLOAT8_B_TILE_HW / sizeof(uint32_t);
+    uint32_t Kt_half = Kt / 2;
+    uint32_t half_tiles_per_row = Kt_half;
+    std::vector<uint32_t> half0(Mt * Kt_half * wpt), half1(Mt * Kt_half * wpt);
+    for (uint32_t m = 0; m < Mt; m++) {
+        uint32_t src_off = m * Kt * wpt;
+        uint32_t dst_off = m * Kt_half * wpt;
+        memcpy(half0.data() + dst_off, packed.data() + src_off, Kt_half * wpt * sizeof(uint32_t));
+        memcpy(half1.data() + dst_off, packed.data() + src_off + Kt_half * wpt, Kt_half * wpt * sizeof(uint32_t));
+    }
+    return {std::move(half0), std::move(half1)};
+}
+
 // Upload packed BFP8_B data to device, return MeshBuffer directly
 static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
                                                             const std::vector<uint32_t>& packed,
@@ -1308,7 +1390,7 @@ static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
     constexpr uint32_t bfp8_tile_bytes = BFLOAT8_B_TILE_HW;  // 1088
 
     // Create DRAM-sharded buffer: each bank stores Mt_per_bank * Kt contiguous tiles
-    uint32_t num_banks = g_num_dram_banks;
+    uint32_t num_banks = device->num_dram_channels();
     uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
     uint32_t Mt_padded = Mt_per_bank * num_banks;
     uint32_t total_pages = Mt_padded * Kt;
@@ -1385,8 +1467,10 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.ssm_out_host); }
 
-            // Upload packed data sequentially (device I/O)
+            // Upload combined weights to chip 0
             g_wt.ssm_w_combined_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
+
+            // FFN weights on chip 0
             g_wt.ssm_ffn_gate_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
             g_wt.ssm_ffn_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
             g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
@@ -1418,8 +1502,10 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.wo_host); }
 
-            // Upload packed data sequentially
+            // Upload QKV weights to chip 0
             g_wt.attn_wqkv_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
+
+            // FFN weights on chip 0
             g_wt.attn_ffn_gate_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_gate, MC::n_ff, MC::n_embd);
             g_wt.attn_ffn_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_up, MC::n_ff, MC::n_embd);
             g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
@@ -1435,12 +1521,28 @@ static void create_weight_tensors() {
     printf("Uploaded %d attention + %d SSM weight tensors as BFLOAT8_B (%.1fs).\n",
            attn_idx, ssm_idx, layer_sec);
 
-    // LM head on chip 0 (fused with output norm in traced chain)
+    // LM head — split across 2 chips for column-parallel if available
     auto p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
     { std::vector<uint16_t>().swap(g_model.output_host); }
-    g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), p_lm, MC::n_vocab, MC::n_embd);
-    g_lm_head_buf = g_wt.lm_head_buf;
-    printf("  lm_head uploaded\n");
+
+    if (g_mesh1) {
+        // Split LM head by M (rows) across 2 chips
+        uint32_t Mt_lm = MC::n_vocab / TILE_HEIGHT;
+        uint32_t Kt_lm = MC::n_embd / TILE_WIDTH;
+        uint32_t Mt0_lm, Mt1_lm;
+        auto [lm_half0, lm_half1] = split_packed_m(p_lm, Mt_lm, Kt_lm, Mt0_lm, Mt1_lm);
+        g_wt.lm_head_Mt0 = Mt0_lm;
+        g_wt.lm_head_Mt1 = Mt1_lm;
+        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), lm_half0, Mt0_lm * TILE_HEIGHT, MC::n_embd);
+        g_wt.lm_head_buf_1 = upload_packed_bfp8b_buf(g_mesh1.get(), lm_half1, Mt1_lm * TILE_HEIGHT, MC::n_embd);
+        g_lm_head_buf = g_wt.lm_head_buf;
+        printf("  lm_head split: chip0 %u rows, chip1 %u rows\n",
+               Mt0_lm * TILE_HEIGHT, Mt1_lm * TILE_HEIGHT);
+    } else {
+        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), p_lm, MC::n_vocab, MC::n_embd);
+        g_lm_head_buf = g_wt.lm_head_buf;
+        printf("  lm_head uploaded (single chip)\n");
+    }
 
     // Assign norm weight buffers for on-device RMSNorm
     printf("Setting up norm weight buffers...\n");
@@ -1487,7 +1589,16 @@ static void create_weight_tensors() {
     get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_head * MC::head_dim); // Attn outproj
     get_gemv_buf(g_mesh.get(), MC::n_ff, MC::n_embd);        // Gate/up projections
     get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);        // Down projection
-    get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);     // LM head
+    if (g_mesh1) {
+        // LM head halves on each chip
+        get_gemv_buf(g_mesh.get(), g_wt.lm_head_Mt0 * TILE_HEIGHT, MC::n_embd);
+        get_gemv_buf(g_mesh1.get(), g_wt.lm_head_Mt1 * TILE_HEIGHT, MC::n_embd);
+        // Norm buffer on chip 1 for pre-layer GEMV and LM head
+        g_norm_dev_buf_1 = MeshBuffer::create(ReplicatedBufferConfig{.size = embd_tiles * tile_bytes},
+                                               dram_cfg, g_mesh1.get());
+    } else {
+        get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);     // LM head (single chip)
+    }
     get_ffn_buf(g_mesh.get());                                // FFN intermediates
     printf("Persistent device buffers created.\n");
 }
@@ -1627,6 +1738,7 @@ static int g_decode_count = 0;
 static double g_time_gemv = 0, g_time_ffn = 0, g_time_ssm = 0, g_time_attn = 0, g_time_lmhead = 0;
 static double g_time_outproj = 0, g_time_reswrite = 0, g_time_host = 0, g_time_norm_mm = 0;
 static double g_time_conv1d = 0, g_time_deltanet = 0, g_time_untilize = 0, g_time_attn_host = 0;
+static double g_time_ffn_wait = 0, g_time_rmsnorm_write = 0, g_time_gemv_read = 0;
 
 static float* forward_decode() {
     using Clock = std::chrono::high_resolution_clock;
@@ -1636,8 +1748,8 @@ static float* forward_decode() {
     // Write hidden state to device (chip 0) — stays on device through all layers
     write_hidden_to_device(g_hidden_f32.data());
 
-    // One-time micro-benchmark: measure per-program overhead at decode 5
-    if (g_decode_count == 5) {
+    // One-time micro-benchmark: measure per-program overhead at decode 5 (single-chip only)
+    if (g_decode_count == 5 && !g_mesh1) {
         Finish(cq0);  // drain everything
         auto& gb_test = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
 
@@ -1799,24 +1911,31 @@ static float* forward_decode() {
             // ======== SSM (Delta-Net) Layer ========
             auto& lw = g_model.ssm_layers[ssm_idx];
 
-            // 1. Host rmsnorm + combined GEMV on device
-            auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
+            // 1. Host rmsnorm + combined GEMV on device (2-chip split if available)
             auto t0 = Clock::now();
 
             // Read hidden from device (blocking read waits for prev FFN chain)
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
+            auto t_after_read = Clock::now();
+            g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
+
             // Host rmsnorm (AVX-512, ~0.03ms — faster than device software float)
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
 
-            // GEMV only
+            auto t_after_norm = Clock::now();
+            g_time_rmsnorm_write += std::chrono::duration<double, std::milli>(t_after_norm - t_after_read).count();
+
+            // GEMV on chip 0
+            auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_w_combined_buf[ssm_idx],
                           gb_comb.out_buf, g_combined_rows, MC::n_embd);
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
 
+            g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_norm).count();
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize combined result
@@ -1947,11 +2066,15 @@ static float* forward_decode() {
                 }
             };
 
-            // Parallelize across 2 threads (main + 1 worker)
-            constexpr int mid_vh = num_v / 2;
-            std::thread worker(process_vheads, 0, mid_vh);
-            process_vheads(mid_vh, num_v);
-            worker.join();
+            // Parallelize across 4 threads (main + 3 workers)
+            constexpr int q1 = num_v / 4;
+            constexpr int q2 = num_v / 2;
+            constexpr int q3 = 3 * num_v / 4;
+            std::thread w1(process_vheads, 0, q1);
+            std::thread w2(process_vheads, q1, q2);
+            std::thread w3(process_vheads, q2, q3);
+            process_vheads(q3, num_v);
+            w1.join(); w2.join(); w3.join();
 
             g_time_deltanet += std::chrono::duration<double, std::milli>(Clock::now() - t_delta).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host0).count();
@@ -1987,30 +2110,39 @@ static float* forward_decode() {
             auto& lw = g_model.attn_layers[attn_idx];
             auto& aw = g_attn_small[attn_idx];
 
-            // 1. Host rmsnorm + QKV GEMV on device
-            auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
+            // 1. Host rmsnorm + QKV GEMV on device (2-chip split if available)
             auto t0 = Clock::now();
 
             // Read hidden from device (blocking read waits for prev FFN chain)
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
+            auto t_after_read = Clock::now();
+            g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
+
             // Host rmsnorm (AVX-512, faster than device software float)
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
 
-            // QKV GEMV
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
-                          gb_qkv.out_buf, g_qkv_rows, MC::n_embd);
-            EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
-            g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            auto t_after_norm = Clock::now();
+            g_time_rmsnorm_write += std::chrono::duration<double, std::milli>(t_after_norm - t_after_read).count();
 
-            // Untilize QKV result
+            // QKV GEMV
             constexpr int q_dim = MC::n_head * MC::head_dim * 2;
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
-            read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
+
+            {
+                auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_wqkv_buf[attn_idx],
+                              gb_qkv.out_buf, g_qkv_rows, MC::n_embd);
+                EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
+                g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_norm).count();
+                g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+                read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
+            }
 
             auto t_host1 = Clock::now();
             // 2. Deinterleave Q and gate
@@ -2063,21 +2195,29 @@ static float* forward_decode() {
                 int kv_h = h / (MC::n_head / MC::n_head_kv);
                 float* qh = q_heads + h * MC::head_dim;
                 float* out = attn_out + h * MC::head_dim;
-                float acc[MC::head_dim];
+                alignas(64) float acc[MC::head_dim];
                 memset(acc, 0, MC::head_dim * sizeof(float));
                 float max_score = -FLT_MAX, sum_exp = 0;
                 for (int kp = 0; kp < kv_len; kp++) {
                     float* kh = g_k_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
-                    float dot = 0;
-                    for (int d = 0; d < MC::head_dim; d++) dot += qh[d] * kh[d];
-                    float score = dot * MC::attn_scale;
+                    // AVX-512 dot product: Q · K
+                    __m512 vdot = _mm512_setzero_ps();
+                    for (int d = 0; d < MC::head_dim; d += 16)
+                        vdot = _mm512_fmadd_ps(_mm512_loadu_ps(qh + d), _mm512_loadu_ps(kh + d), vdot);
+                    float score = _mm512_reduce_add_ps(vdot) * MC::attn_scale;
                     float new_max = std::max(max_score, score);
                     float exp_s = expf(score - new_max);
                     float corr = expf(max_score - new_max);
                     sum_exp = sum_exp * corr + exp_s;
+                    // AVX-512 weighted accumulation: acc = acc * corr + exp_s * V
                     float* vh = g_v_cache[attn_idx].data() + (size_t)kp * kv_dim + kv_h * MC::head_dim;
-                    for (int d = 0; d < MC::head_dim; d++)
-                        acc[d] = acc[d] * corr + exp_s * vh[d];
+                    __m512 vcorr = _mm512_set1_ps(corr);
+                    __m512 vexp = _mm512_set1_ps(exp_s);
+                    for (int d = 0; d < MC::head_dim; d += 16) {
+                        __m512 va = _mm512_load_ps(acc + d);
+                        va = _mm512_fmadd_ps(vexp, _mm512_loadu_ps(vh + d), _mm512_mul_ps(va, vcorr));
+                        _mm512_store_ps(acc + d, va);
+                    }
                     max_score = new_max;
                 }
                 // Output + sigmoid gating fused
@@ -2117,9 +2257,8 @@ static float* forward_decode() {
         }
     }
 
-    // Output norm (host) + LM head GEMV (device, traced)
+    // Output norm (host) + LM head GEMV (device)
     auto t_lm = Clock::now();
-    auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
 
     // Read hidden from device (waits for last FFN chain)
     read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
@@ -2128,25 +2267,69 @@ static float* forward_decode() {
     rmsnorm(g_hidden_f32.data(), g_output_norm.data(), g_norm_out.data(), MC::n_embd);
     write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
 
-    // LM head GEMV (traced for fast dispatch)
-    if (!g_lmhead_trace_valid) {
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                      MC::n_vocab, MC::n_embd);
-        Finish(cq0);
-        auto tid = g_mesh->begin_mesh_trace(0);
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                      MC::n_vocab, MC::n_embd);
-        g_mesh->end_mesh_trace(0, tid);
-        g_lmhead_trace = tid;
-        g_lmhead_trace_valid = true;
-    } else {
-        g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
-    }
-    EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
-
-    // Untilize logits
     float* logits = g_logits.data();
-    read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
+
+    if (g_mesh1) {
+        // 2-chip LM head: split rows across chips for 2x bandwidth
+        uint32_t M0 = g_wt.lm_head_Mt0 * TILE_HEIGHT;
+        uint32_t M1 = g_wt.lm_head_Mt1 * TILE_HEIGHT;
+        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd);
+        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd);
+        auto& cq1 = g_mesh1->mesh_command_queue();
+
+        // Write norm to chip 1 (chip 0 already has it from above)
+        write_f32_to_buf(g_norm_dev_buf_1, g_norm_out.data(), MC::n_embd, g_mesh1.get());
+
+        if (!g_lmhead_trace_valid) {
+            // Warmup both chips
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            Finish(cq0); Finish(cq1);
+
+            // Capture chip 0 trace
+            auto tid0 = g_mesh->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            g_mesh->end_mesh_trace(0, tid0);
+
+            // Capture chip 1 trace
+            auto tid1 = g_mesh1->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            g_mesh1->end_mesh_trace(0, tid1);
+
+            g_lmhead_trace = tid0;
+            g_lmhead_trace_1 = tid1;
+            g_lmhead_trace_valid = true;
+        } else {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+            g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
+        }
+
+        // Read from both chips (blocking reads — each waits for its chip's GEMV)
+        EnqueueReadMeshBuffer(cq1, gb_lm1.out_host_tiled, gb_lm1.out_buf, true);
+        EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
+
+        // Untilize: chip 0 has first M0 rows, chip 1 has next M1 rows
+        read_gemv_to_f32(gb_lm0, logits, M0);
+        read_gemv_to_f32(gb_lm1, logits + M0, M1);
+    } else {
+        // Single-chip LM head (traced)
+        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+        if (!g_lmhead_trace_valid) {
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                          MC::n_vocab, MC::n_embd);
+            Finish(cq0);
+            auto tid = g_mesh->begin_mesh_trace(0);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
+                          MC::n_vocab, MC::n_embd);
+            g_mesh->end_mesh_trace(0, tid);
+            g_lmhead_trace = tid;
+            g_lmhead_trace_valid = true;
+        } else {
+            g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
+        }
+        EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
+        read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
+    }
     g_time_lmhead += std::chrono::duration<double, std::milli>(Clock::now() - t_lm).count();
 
     g_decode_count++;
@@ -2157,6 +2340,8 @@ static float* forward_decode() {
                g_time_host / dc, g_time_reswrite / dc, g_time_lmhead / dc);
         printf("    host_detail: conv1d=%.1f deltanet=%.1f untilize=%.1f attn=%.1f ms/tok\n",
                g_time_conv1d / dc, g_time_deltanet / dc, g_time_untilize / dc, g_time_attn_host / dc);
+        printf("    norm_mm_detail: ffn_wait=%.1f rmsnorm_write=%.1f gemv_read=%.1f ms/tok\n",
+               g_time_ffn_wait / dc, g_time_rmsnorm_write / dc, g_time_gemv_read / dc);
     }
 
     return logits;
@@ -2169,24 +2354,50 @@ static float* forward_decode() {
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
-    // Open chip 0 only (opening 2 devices adds ~10ms/tok driver overhead)
-    auto meshes = MeshDevice::create_unit_meshes({0});
-    g_mesh = meshes[0];
+    // Open both N300 chips as a 1×2 MeshDevice, then create submeshes
+    bool dual_chip = false;
+    try {
+        g_mesh2 = MeshDevice::create(
+            MeshDeviceConfig(MeshShape(1, 2)),
+            DEFAULT_L1_SMALL_SIZE,
+            DEFAULT_TRACE_REGION_SIZE,
+            1,  // num_command_queues
+            DispatchCoreConfig{DispatchCoreType::WORKER});
+        // Create chip 0 and chip 1 submeshes
+        g_mesh = g_mesh2->create_submesh(MeshShape(1, 1), MeshCoordinate(0, 0));
+        g_mesh1 = g_mesh2->create_submesh(MeshShape(1, 1), MeshCoordinate(0, 1));
+        dual_chip = true;
+        printf("Opened 2-chip MeshDevice, chip 0 submesh + chip 1 submesh\n");
+    } catch (const std::exception& e) {
+        printf("Failed to open 1x2 mesh: %s\nFalling back to single chip.\n", e.what());
+        g_mesh = MeshDevice::create_unit_mesh(0);
+        g_mesh1 = nullptr;
+        g_mesh2 = nullptr;
+    }
 
     auto grid = g_mesh->compute_with_storage_grid_size();
-    printf("Chip 0 opened: compute grid %zux%zu (%zu cores)\n",
-           grid.x, grid.y, grid.x * grid.y);
+    printf("Chip 0: compute grid %zux%zu (%zu cores)\n", grid.x, grid.y, grid.x * grid.y);
+    if (g_mesh1) {
+        auto grid1 = g_mesh1->compute_with_storage_grid_size();
+        printf("Chip 1: compute grid %zux%zu (%zu cores)\n", grid1.x, grid1.y, grid1.x * grid1.y);
+    }
 
-    // Query DRAM bank topology for sharded GEMV
+    // Query DRAM bank topology for sharded GEMV (chip 0)
     g_num_dram_banks = g_mesh->num_dram_channels();
     g_dram_workers = g_mesh->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_0);
-    printf("DRAM banks: %u, optimal workers:\n", g_num_dram_banks);
+    printf("Chip 0 DRAM banks: %u, optimal workers:\n", g_num_dram_banks);
     for (uint32_t b = 0; b < g_num_dram_banks; b++) {
         printf("  bank %u -> core (%zu, %zu)\n", b, g_dram_workers[b].x, g_dram_workers[b].y);
+    }
+    if (g_mesh1) {
+        g_num_dram_banks_1 = g_mesh1->num_dram_channels();
+        g_dram_workers_1 = g_mesh1->get_optimal_dram_bank_to_logical_worker_assignment(NOC::NOC_0);
+        printf("Chip 1 DRAM banks: %u\n", g_num_dram_banks_1);
     }
 
     // Enable program cache for faster repeated matmul dispatch
     g_mesh->enable_program_cache();
+    if (g_mesh1) g_mesh1->enable_program_cache();
 
     MeshCommandQueue& cq = g_mesh->mesh_command_queue();
     g_max_ctx = max_ctx;
@@ -2347,6 +2558,7 @@ void shutdown() {
     }
     if (g_lmhead_trace_valid) {
         g_mesh->release_mesh_trace(g_lmhead_trace);
+        if (g_mesh1) g_mesh1->release_mesh_trace(g_lmhead_trace_1);
         g_lmhead_trace_valid = false;
     }
 
@@ -2390,8 +2602,11 @@ void shutdown() {
         l.attn_norm.reset(); l.post_attn_norm.reset();
     }
 
-    if (g_mesh) {
-        g_mesh->close();
-        g_mesh.reset();
+    // Close submeshes first, then parent mesh
+    g_mesh.reset();
+    g_mesh1.reset();
+    if (g_mesh2) {
+        g_mesh2->close();
+        g_mesh2.reset();
     }
 }
