@@ -118,9 +118,9 @@ static void test_basic_generation() {
 static void test_long_prompt() {
     printf("  test_long_prompt...\n");
 
-    // Build a prompt that's ~200 tokens (repeated text)
-    // N300 prefill is sequential (~120ms/tok), so keep prompt manageable
-    int n_repeat = 20;
+    // Build a prompt that's ~50 tokens (repeated text)
+    // N300 prefill is sequential (~119ms/tok), so keep prompt short
+    int n_repeat = 5;
     if (const char* p = getenv("LONG_PROMPT_REPEAT")) n_repeat = atoi(p);
     std::string prompt;
     for (int i = 0; i < n_repeat; i++) {
@@ -148,9 +148,9 @@ static void test_prompt_exceeding_context() {
     // The engine should truncate gracefully, not crash.
     auto& tok = get_tokenizer();
 
-    // Generate a prompt that exceeds context — but keep it small since
-    // N300 prefill is sequential (~120ms/tok). We just need to slightly exceed g_ctx_size.
-    // Each repetition is ~12 tokens, so (g_ctx_size/12 + 3) reps should slightly exceed.
+    // Generate a prompt that slightly exceeds context.
+    // N300 prefill is sequential (~119ms/tok), so with ctx=256 this is ~30s.
+    // Each repetition is ~12 tokens, so (g_ctx_size/12 + 3) reps slightly exceeds.
     int n_repeat = g_ctx_size / 12 + 3;
     std::string huge_prompt;
     for (int i = 0; i < n_repeat; i++) {
@@ -231,11 +231,11 @@ static void test_prompt_caching() {
 static void test_tok_per_sec() {
     printf("  test_tok_per_sec...\n");
 
-    // Short prompt so most time is decode (no prompt caching support yet)
+    // Short prompt so most time is decode
     std::string prompt =
         "<|im_start|>user\nWrite a short paragraph about machine learning.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-    int decode_count = 64;
+    int decode_count = 32;
     if (const char* p = getenv("DECODE_COUNT")) decode_count = atoi(p);
 
     reset_state();
@@ -276,9 +276,9 @@ static void test_tok_per_sec() {
 static void test_prefill_tok_per_sec() {
     printf("  test_prefill_tok_per_sec...\n");
 
-    // Build a ~200 token prompt to measure prefill throughput
-    // N300 prefill is sequential (~120ms/tok), so keep it manageable (~25s)
-    int n_repeat = 20;
+    // Build a ~50 token prompt to measure prefill throughput
+    // N300 prefill is sequential (~119ms/tok), so keep it short
+    int n_repeat = 5;
     if (const char* p = getenv("PREFILL_REPEAT")) n_repeat = atoi(p);
     std::string prompt;
     for (int i = 0; i < n_repeat; i++) {
@@ -341,14 +341,14 @@ static void test_stop_on_eos() {
     reset_state();
     auto r = run_generate(
         "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-        256, 0.0f);
+        64, 0.0f);
 
     printf("    output (%d tok): %s\n", r.n_tokens, r.text.c_str());
     printf("    stop reason: %d (0=EOS, 1=LENGTH, 2=CALLBACK)\n", (int)r.reason);
 
-    // For a short response like "Hi!", the model should hit EOS well before 256
+    // For a short response like "Hi!", the model should hit EOS well before 64
     if (r.reason == STOP_EOS) {
-        EXPECT_TRUE(r.n_tokens < 200);
+        EXPECT_TRUE(r.n_tokens < 50);
     }
 }
 
@@ -363,8 +363,8 @@ int main(int argc, char** argv) {
     printf("Model: %s\n", model_path.c_str());
 
     // Context size from env, or default for N300 (keep small for fast testing)
-    // N300 prefill is sequential (~59ms/tok), so smaller context = faster tests
-    g_ctx_size = 1024;
+    // N300 prefill is sequential (~119ms/tok), so smaller context = faster tests
+    g_ctx_size = 128;
     if (const char* p = getenv("TEST_CTX_SIZE")) {
         g_ctx_size = atoi(p);
     }

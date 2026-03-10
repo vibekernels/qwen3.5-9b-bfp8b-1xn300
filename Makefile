@@ -102,14 +102,14 @@ $(BUILD)/test_mesh_overhead: src/tests/test_mesh_overhead.cpp
 
 # Quick smoke test: "The capital of France is" → should output "Paris"
 quicktest: $(BUILD)/test_forward
-	@env TT_METAL_RUNTIME_ROOT=$(TT_METAL_HOME) QUIET=1 \
+	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		$(BUILD)/test_forward \
 		$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} \
 		"The capital of France is" 16 --raw 2>/dev/null
 
 # Run integration test suite
 test: $(BUILD)/test_inference
-	@env TT_METAL_RUNTIME_ROOT=$(TT_METAL_HOME) \
+	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) \
 		MODEL_PATH=$${MODEL_PATH:-/home/ubuntu/qwen3.5-9b-bf16-1x5090/models/Qwen3.5-9B-BF16.gguf} \
 		QUIET=1 \
 		$(BUILD)/test_inference 2>/dev/null
