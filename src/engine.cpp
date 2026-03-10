@@ -40,6 +40,10 @@
 #include <immintrin.h>
 #include <sys/stat.h>
 
+// Suppress deprecation warnings from tt-metal's transitional global-scope aliases
+// (CoreCoord, CoreRange, CoreRangeSet, stl→ttsl) — we use the tt::tt_metal:: versions via using-namespace.
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 // blockfloat_common not installed in build; use source tree path
 #include "/home/ubuntu/tt-metal/tt_metal/impl/data_format/blockfloat_common.hpp"
 
@@ -1214,7 +1218,7 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
 
         // Get virtual NOC coordinates for all worker cores
         // Use the first device in the mesh to convert logical→virtual
-        auto* dev0 = device->get_device(MeshCoordinate(0, 0));
+        auto* dev0 = device->get_device(0, 0);
         std::vector<CoreCoord> noc_coords(num_banks);
         for (uint32_t b = 0; b < num_banks; b++) {
             noc_coords[b] = dev0->worker_core_from_logical_core(dram_workers[b]);
