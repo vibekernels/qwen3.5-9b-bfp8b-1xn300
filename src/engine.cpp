@@ -418,10 +418,9 @@ static void dispatch_gemv(MeshDevice* device,
                 .set_page_size(CBIndex::c_16, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_out_cfg);
 
-        // Reader: reads act + weight from interleaved DRAM via TensorAccessor
+        // DRAM-sharded reader: reads act from interleaved buf, weight from assigned bank
         std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
         TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
-        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
 
         auto reader_kid = CreateKernel(program,
             kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
@@ -452,10 +451,10 @@ static void dispatch_gemv(MeshDevice* device,
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
-            // Reader: [act_addr, weight_addr, Mt_per_core, weight_start_tile]
+            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, start_row * Kt});
+                            mt_this_core, b, 0u});
 
             // Compute: [Mt_per_core]
             SetRuntimeArgs(program, compute_kid, core,
@@ -545,10 +544,9 @@ static void dispatch_gemv_resadd(MeshDevice* device,
                 .set_page_size(CBIndex::c_2, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_scratch_cfg);
 
-        // Reader: reads act + weight from interleaved DRAM via TensorAccessor
+        // DRAM-sharded reader: reads act from interleaved buf, weight from assigned bank
         std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
         TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
-        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
 
         auto reader_kid = CreateKernel(program,
             kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
@@ -578,9 +576,10 @@ static void dispatch_gemv_resadd(MeshDevice* device,
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
+            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, start_row * Kt});
+                            mt_this_core, b, 0u});
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)residual_buf->address(), mt_this_core, start_row});
@@ -660,10 +659,9 @@ static void dispatch_gemv_split(MeshDevice* device,
                 .set_page_size(CBIndex::c_16, bf16_tile_bytes);
         CreateCircularBuffer(program, all_cores, cb_out_cfg);
 
-        // Reader: reads act + weight from interleaved DRAM via TensorAccessor
+        // DRAM-sharded reader: reads act from interleaved buf, weight from assigned bank
         std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
         TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
-        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
 
         auto reader_kid = CreateKernel(program,
             kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
@@ -694,9 +692,10 @@ static void dispatch_gemv_split(MeshDevice* device,
             uint32_t mt_this_core = (start_row >= Mt) ? 0 :
                                     std::min(Mt_per_bank, Mt - start_row);
 
+            // Reader: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
             SetRuntimeArgs(program, reader_kid, core,
                            {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
-                            mt_this_core, start_row * Kt});
+                            mt_this_core, b, 0u});
             SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
             SetRuntimeArgs(program, writer_kid, core,
                            {(uint32_t)dst0_buf->address(), (uint32_t)dst1_buf->address(),
@@ -1924,25 +1923,58 @@ split_packed_k(const std::vector<uint32_t>& packed, uint32_t Mt, uint32_t Kt) {
     return {std::move(half0), std::move(half1)};
 }
 
-// Upload packed BFP8_B data to device, return MeshBuffer directly
+// Upload packed BFP8_B data to device as DRAM-sharded buffer.
+// Each of the 12 DRAM banks stores Mt_per_bank * Kt contiguous tiles,
+// enabling bank-local reads with TRID pipelining for maximum bandwidth.
 static std::shared_ptr<MeshBuffer> upload_packed_bfp8b_buf(MeshDevice* device,
                                                             const std::vector<uint32_t>& packed,
                                                             uint32_t M, uint32_t K) {
     constexpr uint32_t TH = TILE_HEIGHT, TW = TILE_WIDTH;
     uint32_t Mt = M / TH, Kt = K / TW;
     constexpr uint32_t bfp8_tile_bytes = BFLOAT8_B_TILE_HW;  // 1088
-    uint32_t total_tiles = Mt * Kt;
 
-    // Interleaved DRAM buffer (tiles distributed round-robin across banks)
+    // Create DRAM-sharded buffer: each bank stores Mt_per_bank * Kt contiguous tiles
+    uint32_t num_banks = device->num_dram_channels();
+    uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+    uint32_t Mt_padded = Mt_per_bank * num_banks;
+    uint32_t total_pages = Mt_padded * Kt;
+    uint32_t pages_per_bank = Mt_per_bank * Kt;
+    uint32_t total_bytes = total_pages * bfp8_tile_bytes;
+
+    // Pad packed data with zero tiles if Mt not divisible by num_banks
+    constexpr uint32_t words_per_tile = bfp8_tile_bytes / sizeof(uint32_t);  // 272
+    uint32_t needed_words = total_pages * words_per_tile;
+    std::vector<uint32_t> padded_packed;
+    if (packed.size() < needed_words) {
+        padded_packed = packed;
+        padded_packed.resize(needed_words, 0);
+    }
+    const auto& write_data = (packed.size() >= needed_words) ? packed : padded_packed;
+
+    // DRAM bank coordinates: 1D range (x=bank_id, y=0) — as per tt-metal convention
+    CoreRange dram_bank_range({0, 0}, {num_banks - 1, 0});
+
+    BufferDistributionSpec shard_spec(
+        Shape{1, total_pages},
+        Shape{1, pages_per_bank},
+        corerange_to_cores(CoreRangeSet(dram_bank_range)));
+
     DeviceLocalBufferConfig dram_cfg{
         .page_size = bfp8_tile_bytes,
-        .buffer_type = BufferType::DRAM};
+        .buffer_type = BufferType::DRAM,
+        .sharding_args = BufferShardingArgs(shard_spec)};
 
-    auto buf = MeshBuffer::create(
-        ReplicatedBufferConfig{.size = total_tiles * bfp8_tile_bytes},
-        dram_cfg, device);
+    Shape2D global_shape(1, total_pages);
+    distributed::ShardedBufferConfig sharded_cfg{
+        .global_size = total_bytes,
+        .global_buffer_shape = global_shape,
+        .shard_shape = global_shape,
+        .shard_orientation = ShardOrientation::ROW_MAJOR,
+    };
+
+    auto buf = MeshBuffer::create(sharded_cfg, dram_cfg, device);
     auto& cq = device->mesh_command_queue();
-    EnqueueWriteMeshBuffer(cq, buf, packed, false);
+    EnqueueWriteMeshBuffer(cq, buf, write_data, false);
     return buf;
 }
 

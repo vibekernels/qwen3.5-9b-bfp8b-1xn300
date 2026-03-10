@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Multi-core GEMV reader: each core reads its assigned weight rows from interleaved DRAM.
+// DRAM-sharded GEMV reader: each core reads from its assigned DRAM bank.
 // Activation tiles loaded ONCE into cb_act (stays in L1 for all output rows).
-// Weight tiles read via TensorAccessor (interleaved buffer, round-robin across banks).
+// Weight tiles read as large contiguous blocks from a single DRAM bank.
 //
-// Compile-time args: [cb_act, cb_weight, Kt, BLOCK, acc_act_config, acc_weight_config]
-// Runtime args: [act_addr, weight_addr, Mt_per_core, weight_start_tile]
+// Compile-time args: [cb_act, cb_weight, Kt, BLOCK, acc_act_config]
+// Runtime args: [act_addr, weight_bank_addr, Mt_per_core, bank_id, weight_start_offset]
 
 #include "api/dataflow/dataflow_api.h"
 #include <cstdint>
 
 void kernel_main() {
-    uint32_t act_addr           = get_arg_val<uint32_t>(0);
-    uint32_t weight_addr        = get_arg_val<uint32_t>(1);
-    uint32_t Mt_per_core        = get_arg_val<uint32_t>(2);
-    uint32_t weight_start_tile  = get_arg_val<uint32_t>(3);
+    uint32_t act_addr              = get_arg_val<uint32_t>(0);
+    uint32_t weight_bank_addr      = get_arg_val<uint32_t>(1);
+    uint32_t Mt_per_core           = get_arg_val<uint32_t>(2);
+    uint32_t bank_id               = get_arg_val<uint32_t>(3);
+    uint32_t weight_start_offset   = get_arg_val<uint32_t>(4);
 
     constexpr uint32_t cb_act    = get_compile_time_arg_val(0);
     constexpr uint32_t cb_weight = get_compile_time_arg_val(1);
@@ -23,30 +24,23 @@ void kernel_main() {
     uint32_t act_tile_size    = get_tile_size(cb_act);
     uint32_t weight_tile_size = get_tile_size(cb_weight);
 
-    // Activation accessor (interleaved)
+    // Activation accessor (interleaved, standard TensorAccessor)
     constexpr auto acc_act_args = TensorAccessorArgs<4>();
     const auto acc_act = TensorAccessor(acc_act_args, act_addr, act_tile_size);
 
-    // Weight accessor (interleaved)
-    constexpr auto acc_weight_args = TensorAccessorArgs<acc_act_args.next_compile_time_args_offset()>();
-    const auto acc_weight = TensorAccessor(acc_weight_args, weight_addr, weight_tile_size);
-
     // Phase 1: Load ALL activation tiles into cb_act (stays in L1)
-    constexpr uint32_t ACT_BATCH = 8;
-    for (uint32_t kt = 0; kt < Kt; kt += ACT_BATCH) {
-        uint32_t batch = (kt + ACT_BATCH <= Kt) ? ACT_BATCH : (Kt - kt);
-        cb_reserve_back(cb_act, batch);
-        uint32_t l1_base = get_write_ptr(cb_act);
-        for (uint32_t b = 0; b < batch; b++) {
-            noc_async_read_tile(kt + b, acc_act, l1_base + b * act_tile_size);
-        }
-        noc_async_read_barrier();
-        cb_push_back(cb_act, batch);
+    cb_reserve_back(cb_act, Kt);
+    uint32_t act_l1_base = get_write_ptr(cb_act);
+    for (uint32_t kt = 0; kt < Kt; kt++) {
+        noc_async_read_tile(kt, acc_act, act_l1_base + kt * act_tile_size);
     }
+    noc_async_read_barrier();
+    cb_push_back(cb_act, Kt);
 
-    // Phase 2: Read weight tiles from interleaved buffer via TensorAccessor.
-    // Each output row needs Kt weight tiles, read in BLOCK-sized batches.
-    uint32_t weight_tile = weight_start_tile;
+    // Phase 2: Read weight tiles from assigned DRAM bank.
+    // Large contiguous reads (BLOCK tiles per noc_async_read), no TRID.
+    uint64_t bank_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, weight_bank_addr);
+    uint32_t weight_offset = weight_start_offset;
 
     for (uint32_t mt = 0; mt < Mt_per_core; mt++) {
         uint32_t num_blocks = (Kt + BLOCK - 1) / BLOCK;
@@ -57,10 +51,10 @@ void kernel_main() {
             cb_reserve_back(cb_weight, batch);
             uint32_t l1_base = get_write_ptr(cb_weight);
 
-            for (uint32_t b = 0; b < batch; b++) {
-                noc_async_read_tile(weight_tile, acc_weight, l1_base + b * weight_tile_size);
-                weight_tile++;
-            }
+            // Single contiguous read for the entire block
+            noc_async_read(bank_noc_addr + weight_offset, l1_base, batch * weight_tile_size);
+            weight_offset += batch * weight_tile_size;
+
             noc_async_read_barrier();
             cb_push_back(cb_weight, batch);
         }
