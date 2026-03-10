@@ -11,45 +11,58 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Discover the pre-installed tt-metalium SDK and create a symlink tree
-# matching the layout our Makefile expects (TT_METAL_BUILD/{include,lib,libexec}).
+# The tt-metalium SDK is installed as part of the ttnn Python package.
+# Discover paths and create a symlink tree matching our Makefile's expected layout:
+#   TT_METAL_BUILD/{include,lib,libexec}
 RUN set -e && TT_SDK=/app/tt-sdk && \
     mkdir -p $TT_SDK/build_Release/lib $TT_SDK/build_Release/libexec \
-             $TT_SDK/tt_metal/impl/data_format && \
-    echo "=== Discovering tt-metalium SDK ===" && \
-    echo "--- libtt_metal.so ---" && find / -name "libtt_metal.so" 2>/dev/null || true && \
-    echo "--- tt-metalium dirs ---" && find / -path "*/tt-metalium" -type d 2>/dev/null | head -10 || true && \
-    echo "--- tt_metal includes ---" && find / -path "*/include/tt-metalium" -type d 2>/dev/null | head -5 || true && \
-    echo "--- spdlog ---" && find / -name "libspdlog*" 2>/dev/null | head -5 || true && \
-    echo "--- tracy ---" && find / -name "libtracy*" 2>/dev/null | head -5 || true && \
-    # Symlink include dir \
-    INC_PARENT=$(dirname $(find / -path "*/include/tt-metalium" -type d 2>/dev/null | head -1) 2>/dev/null) && \
-    if [ -n "$INC_PARENT" ] && [ -d "$INC_PARENT" ]; then \
-        ln -sf "$INC_PARENT" $TT_SDK/build_Release/include; \
+             $TT_SDK/build_Release/include $TT_SDK/tt_metal/impl/data_format && \
+    # Find the ttnn package root \
+    TTNN_PKG=$(python3 -c "import ttnn; import os; print(os.path.dirname(ttnn.__file__))") && \
+    echo "TTNN package: $TTNN_PKG" && \
+    # Include: tt-metalium headers are under ttnn/tt_metal/api/ \
+    API_DIR="$TTNN_PKG/tt_metal/api" && \
+    if [ -d "$API_DIR/tt-metalium" ]; then \
+        ln -sf "$API_DIR/tt-metalium" $TT_SDK/build_Release/include/tt-metalium; \
     fi && \
-    # Symlink libexec/tt-metalium \
-    LIBEXEC=$(find / -path "*/libexec/tt-metalium" -type d 2>/dev/null | head -1) && \
-    if [ -n "$LIBEXEC" ] && [ -d "$LIBEXEC" ]; then \
-        ln -sf "$LIBEXEC" $TT_SDK/build_Release/libexec/tt-metalium; \
-    fi && \
-    # Symlink each required library (search everywhere) \
-    for lib in libtt_metal.so libdevice.so libtt_stl.so; do \
-        src=$(find / -name "$lib" \( -type f -o -type l \) 2>/dev/null | head -1); \
-        if [ -n "$src" ]; then ln -sf "$src" $TT_SDK/build_Release/lib/$lib; fi; \
+    # Include: metalium-thirdparty headers \
+    for thirdparty_candidate in "$API_DIR/../../../metalium-thirdparty" \
+                                "$TTNN_PKG/metalium-thirdparty" \
+                                "$(dirname $TTNN_PKG)/metalium-thirdparty"; do \
+        if [ -d "$thirdparty_candidate" ]; then \
+            ln -sf "$(realpath $thirdparty_candidate)" $TT_SDK/build_Release/include/metalium-thirdparty; \
+            break; \
+        fi; \
     done && \
-    # Tracy (version-specific soname) \
-    tracy=$(find / -name "libtracy.so*" \( -type f -o -type l \) 2>/dev/null | head -1); \
-    if [ -n "$tracy" ]; then \
-        ln -sf "$tracy" $TT_SDK/build_Release/lib/libtracy.so; \
-        ln -sf "$tracy" $TT_SDK/build_Release/lib/$(basename "$tracy"); \
+    # Libexec: symlink tt-metalium dir (for hostdevcommon and internal headers) \
+    if [ -d "$API_DIR/tt-metalium" ]; then \
+        ln -sf "$API_DIR/tt-metalium" $TT_SDK/build_Release/libexec/tt-metalium; \
     fi && \
-    # spdlog (static or shared) \
-    spdlog=$(find / -name "libspdlog.a" -o -name "libspdlog.so" 2>/dev/null | head -1); \
+    # Libraries from ttnn build dir \
+    TTNN_LIB="$TTNN_PKG/build/lib" && \
+    for lib in libtt_metal.so libdevice.so libtt_stl.so; do \
+        if [ -f "$TTNN_LIB/$lib" ] || [ -L "$TTNN_LIB/$lib" ]; then \
+            ln -sf "$TTNN_LIB/$lib" $TT_SDK/build_Release/lib/$lib; \
+        else \
+            found=$(find / -name "$lib" \( -type f -o -type l \) 2>/dev/null | head -1); \
+            if [ -n "$found" ]; then ln -sf "$found" $TT_SDK/build_Release/lib/$lib; fi; \
+        fi; \
+    done && \
+    # Tracy (versioned soname in ttnn.libs/) \
+    TTNN_LIBS_DIR="$(dirname $TTNN_PKG)/ttnn.libs" && \
+    tracy=$(find "$TTNN_LIBS_DIR" / -name "libtracy*.so*" \( -type f -o -type l \) 2>/dev/null | head -1); \
+    if [ -n "$tracy" ]; then \
+        ln -sf "$tracy" $TT_SDK/build_Release/lib/libtracy.so.0.10.0; \
+    fi && \
+    # spdlog \
+    spdlog=$(find "$TTNN_LIB" "$TTNN_LIBS_DIR" / -name "libspdlog*" \( -type f -o -type l \) 2>/dev/null | head -1); \
     if [ -n "$spdlog" ]; then \
         ln -sf "$spdlog" $TT_SDK/build_Release/lib/$(basename "$spdlog"); \
     fi && \
-    echo "=== SDK shim result ===" && ls -la $TT_SDK/build_Release/lib/ && \
-    ls -la $TT_SDK/build_Release/include/ 2>/dev/null || true
+    # Debug: show what we found \
+    echo "=== SDK shim libs ===" && ls -la $TT_SDK/build_Release/lib/ && \
+    echo "=== SDK shim includes ===" && ls -la $TT_SDK/build_Release/include/ && \
+    echo "=== SDK shim libexec ===" && ls -la $TT_SDK/build_Release/libexec/
 
 # Copy project source
 COPY src/ src/
@@ -57,8 +70,7 @@ COPY third_party/json.hpp third_party/json.hpp
 COPY Makefile .
 
 # Build using the pre-installed SDK.
-# Touch the libtt_metal.so target first so Make skips the auto-setup rule
-# (which tries git submodule update).
+# Touch libtt_metal.so so Make skips the auto-setup rule.
 RUN touch /app/tt-sdk/build_Release/lib/libtt_metal.so && \
     make -j$(nproc) \
     TT_METAL_HOME=/app/tt-sdk \
