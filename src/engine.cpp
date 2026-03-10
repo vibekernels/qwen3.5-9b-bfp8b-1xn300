@@ -396,9 +396,10 @@ static void dispatch_gemv(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        // BLOCK=32: good balance of DRAM read efficiency and reader/compute pipelining
-        uint32_t effective_block = std::min(32u, Kt);
-        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
+        // BLOCK=Kt: single contiguous read per row, minimal overhead.
+        // Compute is negligible vs DRAM reads; double-buffered for row overlap.
+        uint32_t effective_block = Kt;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for row overlap
 
         // Activation CB: Kt tiles (loaded once, reused for all output rows)
         CircularBufferConfig cb_act_cfg =
@@ -517,9 +518,10 @@ static void dispatch_gemv_resadd(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        // BLOCK=32: good balance of DRAM read efficiency and reader/compute pipelining
-        uint32_t effective_block = std::min(32u, Kt);
-        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
+        // BLOCK=Kt: single contiguous read per row, minimal overhead.
+        // Compute is negligible vs DRAM reads; double-buffered for row overlap.
+        uint32_t effective_block = Kt;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for row overlap
 
         // Activation CB (c_0)
         CircularBufferConfig cb_act_cfg =
@@ -639,9 +641,10 @@ static void dispatch_gemv_split(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        // BLOCK=32: good balance of DRAM read efficiency and reader/compute pipelining
-        uint32_t effective_block = std::min(32u, Kt);
-        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
+        // BLOCK=Kt: single contiguous read per row, minimal overhead.
+        // Compute is negligible vs DRAM reads; double-buffered for row overlap.
+        uint32_t effective_block = Kt;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for row overlap
 
         // Activation CB (c_0)
         CircularBufferConfig cb_act_cfg =
