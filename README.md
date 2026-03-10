@@ -66,10 +66,10 @@ This produces test binaries: `test_device`, `test_matmul`, `test_load_weights`, 
 
 ## Running inference
 
-Requires `sudo` (for device access) and `TT_METAL_RUNTIME_ROOT` pointing to your tt-metal source tree:
+Requires `TT_METAL_RUNTIME_ROOT` pointing to your tt-metal source tree:
 
 ```sh
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal \
+TT_METAL_RUNTIME_ROOT=/path/to/tt-metal \
   ./build/test_forward /path/to/Qwen3.5-9B-BF16.gguf "What is the capital of France?" 128
 ```
 
@@ -77,13 +77,13 @@ Pass `--raw` as a 4th argument to skip the chat template and send the prompt dir
 
 ## Tests
 
-All tests require `sudo` and `TT_METAL_RUNTIME_ROOT`:
+All tests require `TT_METAL_RUNTIME_ROOT`:
 
 ```sh
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_device        # validate N300 device opens
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic matmul
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_load_weights  # GGUF weight loading
-sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full generation test
+TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_device        # validate N300 device opens
+TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_matmul        # basic matmul
+TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_load_weights  # GGUF weight loading
+TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full generation test
 ```
 
 ## Project structure
