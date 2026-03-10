@@ -1,6 +1,5 @@
 .git
 build/
-*.o
-*.a
+third_party/tt-metal/
 .github/
 CLAUDE.md
