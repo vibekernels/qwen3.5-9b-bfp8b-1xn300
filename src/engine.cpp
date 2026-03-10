@@ -38,6 +38,7 @@
 #include <atomic>
 #include <functional>
 #include <immintrin.h>
+#include <sys/stat.h>
 
 // blockfloat_common not installed in build; use source tree path
 #include "/home/ubuntu/tt-metal/tt_metal/impl/data_format/blockfloat_common.hpp"
@@ -1953,11 +1954,203 @@ static std::shared_ptr<MeshBuffer> copy_norm_buf_to_chip1(std::shared_ptr<MeshBu
     return dst;
 }
 
+// ============================================================================
+// BFP8_B weight cache — skip CPU packing on subsequent runs
+// ============================================================================
+
+struct BFP8CacheHeader {
+    char magic[4];       // "BFP8"
+    uint32_t version;    // 1
+    uint64_t gguf_size;  // for invalidation
+    uint64_t gguf_mtime; // for invalidation
+    uint32_t n_entries;  // 161 = 32 layers * 5 + 1 LM head
+};
+
+static bool check_bfp8_cache(const char* model_path, const std::string& cache_path) {
+    struct stat model_st;
+    if (stat(model_path, &model_st) != 0) return false;
+
+    FILE* cf = fopen(cache_path.c_str(), "rb");
+    if (!cf) return false;
+
+    BFP8CacheHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, cf) != 1) { fclose(cf); return false; }
+    fclose(cf);
+
+    if (memcmp(hdr.magic, "BFP8", 4) != 0 || hdr.version != 1) return false;
+    if (hdr.gguf_size != (uint64_t)model_st.st_size) return false;
+    if (hdr.gguf_mtime != (uint64_t)model_st.st_mtime) return false;
+    return true;
+}
+
+// Helper: write one packed buffer entry to cache file
+static void cache_write_entry(FILE* cf, uint32_t M, uint32_t K,
+                               const std::vector<uint32_t>& packed) {
+    uint64_t data_words = packed.size();
+    fwrite(&M, 4, 1, cf);
+    fwrite(&K, 4, 1, cf);
+    fwrite(&data_words, 8, 1, cf);
+    fwrite(packed.data(), sizeof(uint32_t), data_words, cf);
+}
+
+// Helper: read one packed buffer entry from cache file
+static std::vector<uint32_t> cache_read_entry(FILE* cf, uint32_t& M_out, uint32_t& K_out) {
+    fread(&M_out, 4, 1, cf);
+    fread(&K_out, 4, 1, cf);
+    uint64_t data_words;
+    fread(&data_words, 8, 1, cf);
+    std::vector<uint32_t> packed(data_words);
+    fread(packed.data(), sizeof(uint32_t), data_words, cf);
+    return packed;
+}
+
+// Upload packed data with TP splitting (shared by both cache-write and cache-read paths)
+static void upload_ssm_layer_packed(int ssm_idx,
+    std::vector<uint32_t>& p_combined, uint32_t combined_rows,
+    std::vector<uint32_t>& p_gate, std::vector<uint32_t>& p_up,
+    std::vector<uint32_t>& p_down, std::vector<uint32_t>& p_out) {
+
+    g_wt.ssm_w_combined_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
+
+    if (g_mesh1) {
+        uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
+        uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
+        auto [gate_h0, gate_h1] = split_packed_m(p_gate, Mt_ff, Kt_embd, Mt0_gate, Mt1_gate);
+        auto [up_h0, up_h1] = split_packed_m(p_up, Mt_ff, Kt_embd, Mt0_up, Mt1_up);
+        uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
+        auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
+        g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
+        g_wt.ssm_ffn_down_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
+        std::vector<uint32_t> gate_up_h0(gate_h0);
+        gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
+        g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
+            (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
+        std::vector<uint32_t> gate_up_h1(gate_h1);
+        gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
+        g_wt.ssm_ffn_gate_up_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
+            (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
+        g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
+        g_wt.ssm_out_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_out, MC::n_embd, MC::ssm_d_inner);
+    } else {
+        std::vector<uint32_t> gate_up(p_gate);
+        gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
+        g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
+        g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
+        g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
+    }
+}
+
+static void upload_attn_layer_packed(int attn_idx,
+    std::vector<uint32_t>& p_qkv, uint32_t qkv_rows,
+    std::vector<uint32_t>& p_gate, std::vector<uint32_t>& p_up,
+    std::vector<uint32_t>& p_down, std::vector<uint32_t>& p_wo) {
+
+    g_wt.attn_wqkv_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
+
+    if (g_mesh1) {
+        uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
+        uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
+        auto [gate_h0, gate_h1] = split_packed_m(p_gate, Mt_ff, Kt_embd, Mt0_gate, Mt1_gate);
+        auto [up_h0, up_h1] = split_packed_m(p_up, Mt_ff, Kt_embd, Mt0_up, Mt1_up);
+        uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
+        auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
+        g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
+        g_wt.attn_ffn_down_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
+        std::vector<uint32_t> gate_up_h0(gate_h0);
+        gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
+        g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
+            (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
+        std::vector<uint32_t> gate_up_h1(gate_h1);
+        gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
+        g_wt.attn_ffn_gate_up_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
+            (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
+        g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
+        g_wt.attn_wo_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
+    } else {
+        std::vector<uint32_t> gate_up(p_gate);
+        gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
+        g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
+        g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
+        g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
+    }
+}
+
+// Load all packed weights from BFP8_B cache and upload to device.
+static void create_weight_tensors_from_cache(const std::string& cache_path) {
+    printf("Loading pre-packed BFP8_B weights from cache...\n");
+    auto t0 = std::chrono::steady_clock::now();
+
+    FILE* cf = fopen(cache_path.c_str(), "rb");
+    BFP8CacheHeader hdr;
+    fread(&hdr, sizeof(hdr), 1, cf);
+
+    int attn_idx = 0, ssm_idx = 0;
+    for (int layer = 0; layer < MC::n_layers; layer++) {
+        uint32_t M0, K0, M1, K1, M2, K2, M3, K3, M4, K4;
+        auto p0 = cache_read_entry(cf, M0, K0);
+        auto p1 = cache_read_entry(cf, M1, K1);
+        auto p2 = cache_read_entry(cf, M2, K2);
+        auto p3 = cache_read_entry(cf, M3, K3);
+        auto p4 = cache_read_entry(cf, M4, K4);
+
+        if (MC::is_recurrent(layer)) {
+            upload_ssm_layer_packed(ssm_idx, p0, M0, p1, p2, p3, p4);
+            if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d uploaded\n", ssm_idx);
+            ssm_idx++;
+        } else {
+            upload_attn_layer_packed(attn_idx, p0, M0, p1, p2, p3, p4);
+            printf("  Attn layer %d uploaded\n", attn_idx);
+            attn_idx++;
+        }
+    }
+
+    // LM head
+    uint32_t lm_M, lm_K;
+    auto p_lm = cache_read_entry(cf, lm_M, lm_K);
+    fclose(cf);
+
+    if (g_mesh1) {
+        uint32_t Mt_lm = lm_M / TILE_HEIGHT;
+        uint32_t Kt_lm = lm_K / TILE_WIDTH;
+        uint32_t Mt0_lm, Mt1_lm;
+        auto [lm_half0, lm_half1] = split_packed_m(p_lm, Mt_lm, Kt_lm, Mt0_lm, Mt1_lm);
+        g_wt.lm_head_Mt0 = Mt0_lm;
+        g_wt.lm_head_Mt1 = Mt1_lm;
+        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), lm_half0, Mt0_lm * TILE_HEIGHT, MC::n_embd);
+        g_wt.lm_head_buf_1 = upload_packed_bfp8b_buf(g_mesh1.get(), lm_half1, Mt1_lm * TILE_HEIGHT, MC::n_embd);
+        g_lm_head_buf = g_wt.lm_head_buf;
+        printf("  lm_head split: chip0 %u rows, chip1 %u rows\n",
+               Mt0_lm * TILE_HEIGHT, Mt1_lm * TILE_HEIGHT);
+    } else {
+        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), p_lm, lm_M, MC::n_embd);
+        g_lm_head_buf = g_wt.lm_head_buf;
+        printf("  lm_head uploaded (single chip)\n");
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    printf("Loaded %d attn + %d SSM weights from cache (%.1fs).\n",
+           attn_idx, ssm_idx, std::chrono::duration<double>(t1 - t0).count());
+}
+
 // Create weight buffers — pack weights as BFP8_B (multi-threaded) then upload.
 // Each weight's host bf16 is freed immediately after packing to minimize peak memory.
-static void create_weight_tensors() {
+// If cache_path is non-empty, writes packed data to cache for next run.
+static void create_weight_tensors(const std::string& cache_path = "") {
     printf("Packing and uploading weights as BFLOAT8_B (multi-threaded)...\n");
     auto t0 = std::chrono::steady_clock::now();
+
+    // Open cache file for writing if path provided
+    FILE* cf = nullptr;
+    if (!cache_path.empty()) {
+        std::string tmp_path = cache_path + ".tmp";
+        cf = fopen(tmp_path.c_str(), "wb");
+        if (cf) {
+            // Write placeholder header — will be finalized at end
+            BFP8CacheHeader hdr{};
+            fwrite(&hdr, sizeof(hdr), 1, cf);
+            printf("  Writing BFP8_B cache to %s\n", cache_path.c_str());
+        }
+    }
 
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
@@ -1984,42 +2177,17 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.ssm_out_host); }
 
-            // Upload combined weights to chip 0 (full, not split)
-            g_wt.ssm_w_combined_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_combined, combined_rows, MC::n_embd);
-
-            if (g_mesh1) {
-                // TP: split FFN weights across 2 chips
-                uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
-                uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
-                auto [gate_h0, gate_h1] = split_packed_m(p_gate, Mt_ff, Kt_embd, Mt0_gate, Mt1_gate);
-                auto [up_h0, up_h1] = split_packed_m(p_up, Mt_ff, Kt_embd, Mt0_up, Mt1_up);
-                uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
-                auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
-                // Chip 0: first half of gate/up rows, first half of down cols
-                g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
-                // Chip 1: second half
-                g_wt.ssm_ffn_down_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
-                // Fused gate+up: concatenate halves for each chip
-                std::vector<uint32_t> gate_up_h0(gate_h0);
-                gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
-                g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
-                    (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
-                std::vector<uint32_t> gate_up_h1(gate_h1);
-                gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
-                g_wt.ssm_ffn_gate_up_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
-                    (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
-                // Replicate outproj on chip 1
-                g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
-                g_wt.ssm_out_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_out, MC::n_embd, MC::ssm_d_inner);
-            } else {
-                // No TP: full FFN weights on chip 0
-                // Fused gate+up: concatenate gate and up
-                std::vector<uint32_t> gate_up(p_gate);
-                gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
-                g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
-                g_wt.ssm_ffn_down_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
-                g_wt.ssm_out_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_out, MC::n_embd, MC::ssm_d_inner);
+            // Write to cache before upload
+            if (cf) {
+                cache_write_entry(cf, combined_rows, MC::n_embd, p_combined);
+                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_gate);
+                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_up);
+                cache_write_entry(cf, MC::n_embd, MC::n_ff, p_down);
+                cache_write_entry(cf, MC::n_embd, MC::ssm_d_inner, p_out);
             }
+
+            // TP split + upload
+            upload_ssm_layer_packed(ssm_idx, p_combined, combined_rows, p_gate, p_up, p_down, p_out);
 
             if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d uploaded\n", ssm_idx);
             ssm_idx++;
@@ -2047,39 +2215,17 @@ static void create_weight_tensors() {
             { std::vector<uint16_t>().swap(lw.ffn_down_host); }
             { std::vector<uint16_t>().swap(lw.wo_host); }
 
-            // Upload QKV weights to chip 0 (full, not split)
-            g_wt.attn_wqkv_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_qkv, qkv_rows, MC::n_embd);
-
-            if (g_mesh1) {
-                // TP: split FFN weights across 2 chips
-                uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
-                uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
-                auto [gate_h0, gate_h1] = split_packed_m(p_gate, Mt_ff, Kt_embd, Mt0_gate, Mt1_gate);
-                auto [up_h0, up_h1] = split_packed_m(p_up, Mt_ff, Kt_embd, Mt0_up, Mt1_up);
-                uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
-                auto [down_h0, down_h1] = split_packed_k(p_down, Mt_embd, Kt_ff);
-                g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), down_h0, MC::n_embd, n_ff_tp);
-                g_wt.attn_ffn_down_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), down_h1, MC::n_embd, n_ff_tp);
-                // Fused gate+up: concatenate halves for each chip
-                std::vector<uint32_t> gate_up_h0(gate_h0);
-                gate_up_h0.insert(gate_up_h0.end(), up_h0.begin(), up_h0.end());
-                g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up_h0,
-                    (Mt0_gate + Mt0_up) * TILE_HEIGHT, MC::n_embd);
-                std::vector<uint32_t> gate_up_h1(gate_h1);
-                gate_up_h1.insert(gate_up_h1.end(), up_h1.begin(), up_h1.end());
-                g_wt.attn_ffn_gate_up_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), gate_up_h1,
-                    (Mt1_gate + Mt1_up) * TILE_HEIGHT, MC::n_embd);
-                // Replicate Wo on chip 1
-                g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
-                g_wt.attn_wo_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh1.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
-            } else {
-                // Fused gate+up
-                std::vector<uint32_t> gate_up(p_gate);
-                gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
-                g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), gate_up, MC::n_ff * 2, MC::n_embd);
-                g_wt.attn_ffn_down_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_down, MC::n_embd, MC::n_ff);
-                g_wt.attn_wo_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), p_wo, MC::n_embd, MC::n_head * MC::head_dim);
+            // Write to cache before upload
+            if (cf) {
+                cache_write_entry(cf, qkv_rows, MC::n_embd, p_qkv);
+                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_gate);
+                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_up);
+                cache_write_entry(cf, MC::n_embd, MC::n_ff, p_down);
+                cache_write_entry(cf, MC::n_embd, MC::n_head * MC::head_dim, p_wo);
             }
+
+            // TP split + upload
+            upload_attn_layer_packed(attn_idx, p_qkv, qkv_rows, p_gate, p_up, p_down, p_wo);
 
             printf("  Attn layer %d uploaded\n", attn_idx);
             attn_idx++;
@@ -2095,8 +2241,11 @@ static void create_weight_tensors() {
     auto p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
     { std::vector<uint16_t>().swap(g_model.output_host); }
 
+    if (cf) {
+        cache_write_entry(cf, MC::n_vocab, MC::n_embd, p_lm);
+    }
+
     if (g_mesh1) {
-        // Split LM head by M (rows) across 2 chips
         uint32_t Mt_lm = MC::n_vocab / TILE_HEIGHT;
         uint32_t Kt_lm = MC::n_embd / TILE_WIDTH;
         uint32_t Mt0_lm, Mt1_lm;
@@ -2114,9 +2263,47 @@ static void create_weight_tensors() {
         printf("  lm_head uploaded (single chip)\n");
     }
 
+    // Finalize cache file
+    if (cf) {
+        fflush(cf);
+        fclose(cf);
+        std::string tmp_path = cache_path + ".tmp";
+        // Now rewrite header with valid data
+        cf = fopen(tmp_path.c_str(), "r+b");
+        if (cf) {
+            // Get GGUF file stats — cache_path is model_path + ".bfp8cache"
+            // model_path = cache_path minus ".bfp8cache" suffix
+            std::string model_path = cache_path.substr(0, cache_path.size() - 10);
+            struct stat st;
+            stat(model_path.c_str(), &st);
+            BFP8CacheHeader hdr;
+            memcpy(hdr.magic, "BFP8", 4);
+            hdr.version = 1;
+            hdr.gguf_size = st.st_size;
+            hdr.gguf_mtime = st.st_mtime;
+            hdr.n_entries = 32 * 5 + 1;  // 161
+            fseek(cf, 0, SEEK_SET);
+            fwrite(&hdr, sizeof(hdr), 1, cf);
+            fclose(cf);
+            rename(tmp_path.c_str(), cache_path.c_str());
+            printf("BFP8_B cache written (%.1f GB).\n",
+                   (double)st.st_size / (1024.0 * 1024.0 * 1024.0));
+            // Print actual cache size
+            struct stat cache_st;
+            if (stat(cache_path.c_str(), &cache_st) == 0) {
+                printf("  Cache file: %.1f GB\n", (double)cache_st.st_size / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+    }
+
+}
+
+// Set up norm buffers, persistent device buffers, and pre-allocate GEMV buffers.
+// Called after weight upload (from either pack or cache path).
+static void setup_post_weight_buffers() {
     // Assign norm weight buffers for on-device RMSNorm
     printf("Setting up norm weight buffers...\n");
-    attn_idx = 0; ssm_idx = 0;
+    int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
         if (MC::is_recurrent(layer)) {
             auto& lw = g_model.ssm_layers[ssm_idx];
@@ -3194,7 +3381,14 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         return false;
     }
 
-    if (!load_gguf_weights(model_path, g_model, g_mesh.get(), cq)) {
+    // Check for BFP8_B weight cache
+    std::string cache_path = std::string(model_path) + ".bfp8cache";
+    bool use_cache = check_bfp8_cache(model_path, cache_path);
+    if (use_cache) {
+        printf("Found valid BFP8_B weight cache: %s\n", cache_path.c_str());
+    }
+
+    if (!load_gguf_weights(model_path, g_model, g_mesh.get(), cq, use_cache)) {
         fprintf(stderr, "Failed to load weights\n");
         return false;
     }
@@ -3219,8 +3413,16 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     precompute_rope(max_ctx);
 
     // Pack and upload weight matrices to device
-    printf("Creating weight tensor wrappers...\n");
-    create_weight_tensors();
+    if (use_cache) {
+        printf("Loading pre-packed weights from cache...\n");
+        create_weight_tensors_from_cache(cache_path);
+    } else {
+        printf("Creating weight tensor wrappers...\n");
+        create_weight_tensors(cache_path);
+    }
+
+    // Shared setup: norms, device buffers, GEMV pre-allocation
+    setup_post_weight_buffers();
 
     printf("Ready.\n");
 
