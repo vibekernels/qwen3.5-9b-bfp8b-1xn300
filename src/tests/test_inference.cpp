@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <thread>
+#include <atomic>
 #include <sys/stat.h>
 
 static int g_failures = 0;
@@ -207,22 +209,45 @@ static void test_emoji_in_output() {
 static void test_prompt_caching() {
     printf("  test_prompt_caching...\n");
 
-    std::string base_prompt = "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n";
+    auto& tok = get_tokenizer();
+    std::string base_prompt = "1+1=";
 
-    // First request
+    // First request — full prefill
     reset_state();
-    auto r1 = run_generate(base_prompt, 32, 0.0f);
-    printf("    first: %d tok, %.1f ms\n", r1.n_tokens, r1.total_ms);
+    auto base_ids = tok.encode(base_prompt);
+    std::vector<int> all_ids = base_ids;
 
-    // Second request with same prefix — should reuse cache
-    std::string extended_prompt = base_prompt;
-    // Simulate a follow-up turn by appending the response and a new turn
-    // But for cache testing, just resend the same prompt
+    GenerateResult r1;
+    r1.reason = STOP_LENGTH;
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto r2 = run_generate(base_prompt, 32, 0.0f);
+    r1.n_tokens = generate(all_ids, 8, 0.0f,
+        [&](int token_id, const std::string& text) -> bool {
+            r1.text += text;
+            all_ids.push_back(token_id);  // track generated token IDs
+            return true;
+        }, &r1.reason);
     auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    printf("    cached: %d tok, %.1f ms\n", r2.n_tokens, ms);
+    r1.total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    printf("    first: %d tok, %.1f ms, text: %s\n", r1.n_tokens, r1.total_ms, r1.text.c_str());
+
+    // Second request — extend with new question using incremental token IDs.
+    // This avoids re-tokenizing the whole string (which causes BPE boundary mismatches).
+    auto suffix_ids = tok.encode(" 2+2=");
+    all_ids.insert(all_ids.end(), suffix_ids.begin(), suffix_ids.end());
+    printf("    extended prompt: %zu tokens (%zu cached + %zu new)\n",
+           all_ids.size(), all_ids.size() - suffix_ids.size(), suffix_ids.size());
+
+    GenerateResult r2;
+    r2.reason = STOP_LENGTH;
+    t0 = std::chrono::high_resolution_clock::now();
+    r2.n_tokens = generate(all_ids, 8, 0.0f,
+        [&](int token_id, const std::string& text) -> bool {
+            r2.text += text;
+            return true;
+        }, &r2.reason);
+    t1 = std::chrono::high_resolution_clock::now();
+    r2.total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    printf("    cached: %d tok, %.1f ms, text: %s\n", r2.n_tokens, r2.total_ms, r2.text.c_str());
 
     EXPECT_TRUE(r1.n_tokens > 0);
     EXPECT_TRUE(r2.n_tokens > 0);
@@ -375,18 +400,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    test_basic_generation();
-    test_long_prompt();
-    test_prompt_exceeding_context();
-    test_emoji_in_output();
-    // test_prompt_caching();  // skipped: prompt caching not yet supported
-    test_tok_per_sec();
-    test_prefill_tok_per_sec();
-    test_greedy_determinism();
-    test_stop_on_eos();
+    // Run each test with a 30s timeout to avoid hangs blocking the suite.
+    int timeout_sec = 30;
+    if (const char* p = getenv("TEST_TIMEOUT")) timeout_sec = atoi(p);
+
+    auto run_with_timeout = [&](const char* name, void(*fn)()) {
+        printf("\n--- %s ---\n", name);
+        fflush(stdout);
+        std::atomic<bool> done{false};
+        std::thread t([&]{ fn(); done.store(true); });
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (done.load()) {
+            t.join();
+        } else {
+            fprintf(stderr, "FAIL %s: TIMEOUT after %ds\n", name, timeout_sec);
+            g_tests++;
+            g_failures++;
+            t.detach();  // abandon hung thread; _exit() will clean up
+        }
+    };
+
+    run_with_timeout("test_basic_generation", test_basic_generation);
+    run_with_timeout("test_long_prompt", test_long_prompt);
+    run_with_timeout("test_prompt_exceeding_context", test_prompt_exceeding_context);
+    run_with_timeout("test_emoji_in_output", test_emoji_in_output);
+    run_with_timeout("test_prompt_caching", test_prompt_caching);
+    run_with_timeout("test_tok_per_sec", test_tok_per_sec);
+    run_with_timeout("test_prefill_tok_per_sec", test_prefill_tok_per_sec);
+    run_with_timeout("test_greedy_determinism", test_greedy_determinism);
+    run_with_timeout("test_stop_on_eos", test_stop_on_eos);
 
     printf("\n%d/%d tests passed\n", g_tests - g_failures, g_tests);
 
     shutdown();
-    return g_failures > 0 ? 1 : 0;
+    int rc = g_failures > 0 ? 1 : 0;
+    _exit(rc);  // force-kill any stuck timeout threads
 }

@@ -114,7 +114,11 @@ int main(int argc, char** argv) {
     auto& tokenizer = get_tokenizer();
     int eos_id = tokenizer.eos_token_id();
 
-    std::vector<std::pair<std::string, std::string>> history;
+    // Maintain token IDs incrementally for prefix caching.
+    // Instead of re-tokenizing the entire conversation each turn, we only
+    // tokenize new text and append those IDs — avoiding BPE boundary issues.
+    std::vector<int> all_ids;
+    bool first_turn = true;
 
     while (true) {
         write_out("> ");
@@ -132,22 +136,36 @@ int main(int argc, char** argv) {
 
         if (user_input.empty()) continue;
 
-        // Build full conversation prompt
-        std::string prompt = build_prompt(history, user_input);
-        auto prompt_tokens = tokenizer.encode(prompt);
-
-        // Check if prompt fits in context
-        if ((int)prompt_tokens.size() >= ctx_size - 4) {
-            write_out("[context full — clearing history]\n");
-            history.clear();
-            prompt = build_prompt(history, user_input);
-            prompt_tokens = tokenizer.encode(prompt);
+        // Build token IDs incrementally
+        if (first_turn) {
+            // First turn: tokenize the full prompt
+            std::string prompt = build_prompt({}, user_input);
+            all_ids = tokenizer.encode(prompt);
+            first_turn = false;
+        } else {
+            // Subsequent turns: tokenize only the new suffix and append
+            // Previous all_ids ends after the last generated token (no EOS).
+            // We need: <|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+            std::string suffix = "<|im_end|>\n<|im_start|>user\n"
+                + user_input
+                + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            auto suffix_ids = tokenizer.encode(suffix);
+            all_ids.insert(all_ids.end(), suffix_ids.begin(), suffix_ids.end());
         }
 
-        int max_gen = ctx_size - (int)prompt_tokens.size();
-        if (max_gen < 1) max_gen = 1;
+        // Check if prompt fits in context
+        if ((int)all_ids.size() >= ctx_size - 4) {
+            write_out("[context full — clearing history]\n");
+            reset_state();
+            first_turn = true;
+            // Re-build with just the current message
+            std::string prompt = build_prompt({}, user_input);
+            all_ids = tokenizer.encode(prompt);
+            first_turn = false;
+        }
 
-        reset_state();
+        int max_gen = ctx_size - (int)all_ids.size();
+        if (max_gen < 1) max_gen = 1;
 
         g_interrupted = 0;
         std::string response;
@@ -156,20 +174,19 @@ int main(int argc, char** argv) {
         // Suppress engine stdout during generate (hides [prefill: ...] etc.)
         suppress_stdout();
 
-        generate(prompt_tokens, max_gen, 0.6f,
+        generate(all_ids, max_gen, 0.6f,
             [&](int token_id, const std::string& text) -> bool {
                 if (g_interrupted) return false;
                 if (token_id == eos_id) return true;  // don't print <|im_end|>
                 write_out(text);
                 response += text;
+                all_ids.push_back(token_id);  // track for prefix caching
                 return true;
             }, &reason);
 
         restore_stdout();
 
         write_out("\n\n");
-
-        history.emplace_back(user_input, response);
     }
 
     suppress_stdout();

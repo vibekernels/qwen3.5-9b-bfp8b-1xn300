@@ -90,6 +90,9 @@ static std::vector<float> g_ssm_state[24];
 static constexpr int conv_state_len = MC::ssm_conv_kernel - 1;  // 3
 static std::vector<float> g_conv_state[24];
 
+// Prefix cache: tokens already processed (prompt + generated), for reuse across generate() calls
+static std::vector<int> g_cached_tokens;
+
 // ============================================================================
 // Cached weight MeshBuffers (on-device, DRAM-sharded BFP8_B tiles)
 // ============================================================================
@@ -4066,13 +4069,37 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         tokens.erase(tokens.begin(), tokens.begin() + ((int)tokens.size() - max_prompt));
     }
 
+    // --- Prefix caching: reuse KV/SSM state for matching prompt prefix ---
+    int prefix_len = 0;
+    {
+        int cache_len = (int)g_cached_tokens.size();
+        int prompt_len = (int)tokens.size();
+        int check_len = std::min(cache_len, prompt_len);
+        while (prefix_len < check_len && tokens[prefix_len] == g_cached_tokens[prefix_len])
+            prefix_len++;
+
+        if (prefix_len < cache_len) {
+            // Cached state diverges from new prompt — full reset required
+            reset_state();
+            prefix_len = 0;
+        }
+        if (prefix_len >= prompt_len) {
+            // Entire prompt already cached (re-generation of same prompt) — reset
+            reset_state();
+            prefix_len = 0;
+        }
+    }
+    int new_tokens = (int)tokens.size() - prefix_len;
+    if (prefix_len > 0)
+        printf("  [prefix cache: reusing %d tokens, prefilling %d new]\n", prefix_len, new_tokens);
+
     auto t_start = std::chrono::high_resolution_clock::now();
 
     // Process prompt tokens in batches of PREFILL_BATCH (32) using batched GEMV.
     // Reads weights once per batch instead of once per token.
     {
         int n_prompt = (int)tokens.size();
-        int offset = 0;
+        int offset = prefix_len;  // skip cached prefix
         const float* logits = nullptr;
 
         while (offset < n_prompt) {
@@ -4104,10 +4131,13 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         }
     }
 
+    // Update cached tokens with the full prompt
+    g_cached_tokens.assign(tokens.begin(), tokens.end());
+
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-    printf("  [prefill: %.1f ms for %zu tokens (%.1f ms/tok)]\n",
-           prefill_ms, tokens.size(), prefill_ms / tokens.size());
+    printf("  [prefill: %.1f ms for %d new tokens (%.1f ms/tok)]\n",
+           prefill_ms, new_tokens, new_tokens > 0 ? prefill_ms / new_tokens : 0.0);
 
     // Generate tokens
     while (total_generated < max_tokens) {
@@ -4134,6 +4164,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
         const float* logits = forward_decode();
         g_pos++;
+        g_cached_tokens.push_back(next_token);  // track for prefix caching
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double tok_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -4162,6 +4193,7 @@ void reset_state() {
         std::fill(g_ssm_state[i].begin(), g_ssm_state[i].end(), 0.0f);
         std::fill(g_conv_state[i].begin(), g_conv_state[i].end(), 0.0f);
     }
+    g_cached_tokens.clear();
 }
 
 const Tokenizer& get_tokenizer() {
