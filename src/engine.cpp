@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <random>
 #include <immintrin.h>
 #include <sys/stat.h>
 
@@ -3990,6 +3991,68 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     return true;
 }
 
+// --- Sampling with temperature and top-p (nucleus) filtering ---
+static std::mt19937 g_rng(std::random_device{}());
+
+static int sample_token(const float* logits, int vocab_size, float temperature) {
+    // Greedy (argmax) when temperature is zero or negligible
+    if (temperature <= 1e-7f) {
+        float max_l = -FLT_MAX;
+        int best = 0;
+        for (int v = 0; v < vocab_size; v++) {
+            if (logits[v] > max_l) { max_l = logits[v]; best = v; }
+        }
+        return best;
+    }
+
+    constexpr float top_p = 0.9f;
+
+    // Temperature-scaled softmax
+    float inv_temp = 1.0f / temperature;
+    float max_l = -FLT_MAX;
+    for (int v = 0; v < vocab_size; v++)
+        if (logits[v] > max_l) max_l = logits[v];
+
+    std::vector<float> probs(vocab_size);
+    float sum = 0.0f;
+    for (int v = 0; v < vocab_size; v++) {
+        probs[v] = std::exp((logits[v] - max_l) * inv_temp);
+        sum += probs[v];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int v = 0; v < vocab_size; v++)
+        probs[v] *= inv_sum;
+
+    // Top-p (nucleus) filtering: sort by probability descending,
+    // keep smallest set whose cumulative probability >= top_p
+    std::vector<int> indices(vocab_size);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::partial_sort(indices.begin(), indices.begin() + std::min(vocab_size, 1024), indices.end(),
+                      [&](int a, int b) { return probs[a] > probs[b]; });
+
+    float cumulative = 0.0f;
+    int cutoff = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        cumulative += probs[indices[i]];
+        cutoff = i + 1;
+        if (cumulative >= top_p) break;
+    }
+
+    // Renormalize the kept tokens and sample
+    float kept_sum = 0.0f;
+    for (int i = 0; i < cutoff; i++)
+        kept_sum += probs[indices[i]];
+
+    std::uniform_real_distribution<float> dist(0.0f, kept_sum);
+    float r = dist(g_rng);
+    float acc = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        acc += probs[indices[i]];
+        if (acc >= r) return indices[i];
+    }
+    return indices[cutoff - 1];
+}
+
 int generate(const std::vector<int>& prompt_tokens, int max_tokens,
              float temperature, TokenCallback cb, StopReason* stop_reason) {
     if (!g_loaded) {
@@ -4065,10 +4128,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
         // Sample first output token from last prefill logits
         if (logits) {
-            float max_l = -FLT_MAX;
-            for (int v = 0; v < MC::n_vocab; v++) {
-                if (logits[v] > max_l) { max_l = logits[v]; next_token = v; }
-            }
+            next_token = sample_token(logits, MC::n_vocab, temperature);
         }
     }
 
@@ -4111,12 +4171,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         double tok_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (g_verbose) printf("  [decode: %.0f ms]\n", tok_ms);
 
-        float max_l = -FLT_MAX;
-        int best = 0;
-        for (int v = 0; v < MC::n_vocab; v++) {
-            if (logits[v] > max_l) { max_l = logits[v]; best = v; }
-        }
-        next_token = best;
+        next_token = sample_token(logits, MC::n_vocab, temperature);
     }
 
     if (stop_reason) *stop_reason = STOP_LENGTH;

@@ -359,6 +359,38 @@ static void test_greedy_determinism() {
     EXPECT_EQ(r1.text, r2.text);
 }
 
+static void test_temperature_sampling() {
+    printf("  test_temperature_sampling...\n");
+
+    // With temperature>0, multiple runs should produce different outputs.
+    // Run the same prompt 3 times at temp=0.6 and check that at least
+    // 2 distinct outputs appear (randomness means we can't guarantee all 3 differ).
+    std::string prompt = "The capital of France is";
+    std::vector<std::string> outputs;
+
+    for (int i = 0; i < 3; i++) {
+        reset_state();
+        auto r = run_generate(prompt, 24, 0.6f);
+        printf("    run%d: %s\n", i + 1, r.text.c_str());
+        EXPECT_TRUE(r.n_tokens > 0);
+        EXPECT_TRUE(!r.text.empty());
+        outputs.push_back(r.text);
+    }
+
+    // Count distinct outputs
+    int distinct = 1;
+    for (int i = 1; i < (int)outputs.size(); i++) {
+        bool is_new = true;
+        for (int j = 0; j < i; j++) {
+            if (outputs[i] == outputs[j]) { is_new = false; break; }
+        }
+        if (is_new) distinct++;
+    }
+
+    printf("    %d distinct outputs out of 3 runs\n", distinct);
+    EXPECT_GE(distinct, 2);
+}
+
 static void test_stop_on_eos() {
     printf("  test_stop_on_eos...\n");
 
@@ -441,6 +473,7 @@ int main(int argc, char** argv) {
     run_with_timeout("test_tok_per_sec", test_tok_per_sec);
     run_with_timeout("test_prefill_tok_per_sec", test_prefill_tok_per_sec);
     run_with_timeout("test_greedy_determinism", test_greedy_determinism);
+    run_with_timeout("test_temperature_sampling", test_temperature_sampling);
     run_with_timeout("test_stop_on_eos", test_stop_on_eos);
 
     printf("\n%d/%d tests passed\n", g_tests - g_failures, g_tests);
