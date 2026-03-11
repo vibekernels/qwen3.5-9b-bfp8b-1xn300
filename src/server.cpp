@@ -119,19 +119,41 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
                 sink.write(role_data.c_str(), role_data.size());
 
                 StopReason reason;
+                std::string utf8_buf;  // buffer for incomplete UTF-8 sequences
 
                 {
                     std::lock_guard<std::mutex> lock(g_inference_mutex);
                     reset_state();
                     generate(prompt_tokens, max_tokens, temperature,
                         [&](int token_id, const std::string& text) -> bool {
+                            if (token_id == tokenizer.eos_token_id()) return true;
+                            utf8_buf += text;
+                            // Find last complete UTF-8 boundary
+                            size_t complete = utf8_buf.size();
+                            if (complete > 0) {
+                                // Walk back from end to find incomplete sequence
+                                size_t i = complete;
+                                while (i > 0 && (utf8_buf[i-1] & 0xC0) == 0x80) i--;  // skip continuation bytes
+                                if (i > 0) {
+                                    unsigned char lead = utf8_buf[i-1];
+                                    int expected = 1;
+                                    if ((lead & 0xE0) == 0xC0) expected = 2;
+                                    else if ((lead & 0xF0) == 0xE0) expected = 3;
+                                    else if ((lead & 0xF8) == 0xF0) expected = 4;
+                                    if (complete - (i-1) < (size_t)expected)
+                                        complete = i - 1;  // incomplete multi-byte char, don't send yet
+                                }
+                            }
+                            if (complete == 0) return true;  // nothing complete to send yet
+                            std::string to_send = utf8_buf.substr(0, complete);
+                            utf8_buf.erase(0, complete);
                             json chunk = {
                                 {"id", completion_id},
                                 {"object", "chat.completion.chunk"},
                                 {"created", created},
                                 {"model", model_name},
                                 {"choices", json::array({
-                                    {{"index", 0}, {"delta", {{"content", text}}}, {"finish_reason", nullptr}}
+                                    {{"index", 0}, {"delta", {{"content", to_send}}}, {"finish_reason", nullptr}}
                                 })}
                             };
                             std::string data = "data: " + chunk.dump() + "\n\n";
@@ -172,6 +194,7 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
             reset_state();
             total_tokens = generate(prompt_tokens, max_tokens, temperature,
                 [&](int token_id, const std::string& text) -> bool {
+                    if (token_id == tokenizer.eos_token_id()) return true;
                     full_response += text;
                     return true;
                 }, &reason);
