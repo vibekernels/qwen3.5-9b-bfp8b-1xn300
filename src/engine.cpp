@@ -2162,9 +2162,15 @@ static void create_weight_tensors(const std::string& cache_path = "") {
             uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
                                    + MC::ssm_dt_rank + MC::ssm_dt_rank;
 
-            // Pack all 5 SSM weights in parallel
+            // Pack all 5 SSM weights (or use pre-packed data from BFP8B GGUF)
             std::vector<uint32_t> p_combined, p_gate, p_up, p_down, p_out;
-            {
+            if (!lw.w_combined_packed.empty()) {
+                p_combined = std::move(lw.w_combined_packed);
+                p_gate     = std::move(lw.ffn_gate_packed);
+                p_up       = std::move(lw.ffn_up_packed);
+                p_down     = std::move(lw.ffn_down_packed);
+                p_out      = std::move(lw.ssm_out_packed);
+            } else {
                 std::thread t1([&]{ p_combined = pack_bf16_as_bfp8b(lw.w_combined_host.data(), combined_rows, MC::n_embd); });
                 std::thread t2([&]{ p_gate = pack_bf16_as_bfp8b(lw.ffn_gate_host.data(), MC::n_ff, MC::n_embd); });
                 std::thread t3([&]{ p_up = pack_bf16_as_bfp8b(lw.ffn_up_host.data(), MC::n_ff, MC::n_embd); });
@@ -2200,9 +2206,15 @@ static void create_weight_tensors(const std::string& cache_path = "") {
             int kv_dim_one = MC::n_head_kv * MC::head_dim;
             int qkv_rows = q_dim + 2 * kv_dim_one;
 
-            // Pack all 5 attention weights in parallel
+            // Pack all 5 attention weights (or use pre-packed data from BFP8B GGUF)
             std::vector<uint32_t> p_qkv, p_gate, p_up, p_down, p_wo;
-            {
+            if (!lw.wqkv_packed.empty()) {
+                p_qkv  = std::move(lw.wqkv_packed);
+                p_gate = std::move(lw.ffn_gate_packed);
+                p_up   = std::move(lw.ffn_up_packed);
+                p_down = std::move(lw.ffn_down_packed);
+                p_wo   = std::move(lw.wo_packed);
+            } else {
                 std::thread t1([&]{ p_qkv = pack_bf16_as_bfp8b(lw.wqkv_host.data(), qkv_rows, MC::n_embd); });
                 std::thread t2([&]{ p_gate = pack_bf16_as_bfp8b(lw.ffn_gate_host.data(), MC::n_ff, MC::n_embd); });
                 std::thread t3([&]{ p_up = pack_bf16_as_bfp8b(lw.ffn_up_host.data(), MC::n_ff, MC::n_embd); });
@@ -2241,8 +2253,13 @@ static void create_weight_tensors(const std::string& cache_path = "") {
            attn_idx, ssm_idx, layer_sec);
 
     // LM head — split across 2 chips for column-parallel if available
-    auto p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
-    { std::vector<uint16_t>().swap(g_model.output_host); }
+    std::vector<uint32_t> p_lm;
+    if (!g_model.output_packed.empty()) {
+        p_lm = std::move(g_model.output_packed);
+    } else {
+        p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
+        { std::vector<uint16_t>().swap(g_model.output_host); }
+    }
 
     if (cf) {
         cache_write_entry(cf, MC::n_vocab, MC::n_embd, p_lm);
@@ -3978,7 +3995,9 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         create_weight_tensors_from_cache(cache_path);
     } else {
         printf("Creating weight tensor wrappers...\n");
-        create_weight_tensors(cache_path);
+        // Don't write a bfp8cache when the GGUF already has pre-packed weights
+        bool gguf_prepacked = !g_model.output_packed.empty();
+        create_weight_tensors(gguf_prepacked ? "" : cache_path);
     }
 
     // Shared setup: norms, device buffers, GEMV pre-allocation

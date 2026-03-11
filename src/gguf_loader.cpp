@@ -39,6 +39,7 @@ enum GGUFType {
 
 enum GGMLType {
     GGML_TYPE_F32 = 0, GGML_TYPE_F16 = 1, GGML_TYPE_BF16 = 30,
+    GGML_TYPE_TT_BFP8B_TILED = 200,  // Tenstorrent BFP8_B pre-packed tile format
 };
 
 struct TensorInfo {
@@ -237,7 +238,12 @@ bool load_gguf_weights(
         fread(&tensors[i].offset, 8, 1, f);
         uint64_t n_elems = 1;
         for (uint32_t d = 0; d < tensors[i].n_dims; d++) n_elems *= tensors[i].dims[d];
-        tensors[i].size_bytes = n_elems * ggml_type_size(tensors[i].type);
+        if (tensors[i].type == GGML_TYPE_TT_BFP8B_TILED && tensors[i].n_dims == 2) {
+            uint64_t M = tensors[i].dims[1], K = tensors[i].dims[0];
+            tensors[i].size_bytes = (M / TILE_HEIGHT) * (K / TILE_WIDTH) * BFLOAT8_B_TILE_HW;
+        } else {
+            tensors[i].size_bytes = n_elems * ggml_type_size(tensors[i].type);
+        }
     }
 
     long header_end = ftell(f);
@@ -267,6 +273,20 @@ bool load_gguf_weights(
         return read_tensor_f32(f, data_start, get(name));
     };
 
+    // Load a pre-packed BFP8_B tensor (type 200) as raw uint32_t words
+    auto load_packed = [&](const std::string& name) -> std::vector<uint32_t> {
+        const auto& ti = get(name);
+        fseek(f, data_start + (long)ti.offset, SEEK_SET);
+        std::vector<uint32_t> result(ti.size_bytes / sizeof(uint32_t));
+        fread(result.data(), sizeof(uint32_t), result.size(), f);
+        return result;
+    };
+
+    // True when large tensors are already in BFP8_B tiled format
+    bool gguf_is_bfp8 = has("output.weight") &&
+        tensors[tmap.at("output.weight")].type == GGML_TYPE_TT_BFP8B_TILED;
+    if (gguf_is_bfp8) printf("Detected BFP8_B tiled GGUF — using pre-packed weights.\n");
+
     printf("Loading weights to device DRAM...\n");
 
     // ===== Global weights =====
@@ -282,12 +302,18 @@ bool load_gguf_weights(
 
     // output (LM head): [n_vocab, n_embd] — stored in HOST memory
     if (!skip_large_weights) {
-        auto data = load_bf16("output.weight");
-        model.output_host.resize(data.size());
-        memcpy(model.output_host.data(), data.data(), data.size() * sizeof(bfloat16));
-        printf("  output: [%d, %d] (host memory, %.1f MB)\n",
-               MC::n_vocab, MC::n_embd,
-               data.size() * 2.0f / (1024 * 1024));
+        if (gguf_is_bfp8) {
+            model.output_packed = load_packed("output.weight");
+            printf("  output: [pre-packed BFP8_B, %.1f MB]\n",
+                   model.output_packed.size() * 4.0f / (1024 * 1024));
+        } else {
+            auto data = load_bf16("output.weight");
+            model.output_host.resize(data.size());
+            memcpy(model.output_host.data(), data.data(), data.size() * sizeof(bfloat16));
+            printf("  output: [%d, %d] (host memory, %.1f MB)\n",
+                   MC::n_vocab, MC::n_embd,
+                   data.size() * 2.0f / (1024 * 1024));
+        }
     } else {
         printf("  output: [skipped — using BFP8_B cache]\n");
     }
@@ -317,23 +343,35 @@ bool load_gguf_weights(
 
             // QKV + Gate + Alpha + Beta → combined: [12352, 4096] — store on host
             if (!skip_large_weights) {
-                auto qkv_data = load_bf16(pname("attn_qkv.weight"));
-                auto gate_data = load_bf16(pname("attn_gate.weight"));
-                auto alpha_data = load_bf16(pname("ssm_alpha.weight"));
-                auto beta_data = load_bf16(pname("ssm_beta.weight"));
+                if (gguf_is_bfp8) {
+                    // Tile-concatenate pre-packed weights along M (same K=n_embd for all)
+                    auto qkv_p   = load_packed(pname("attn_qkv.weight"));
+                    auto gate_p  = load_packed(pname("attn_gate.weight"));
+                    auto alpha_p = load_packed(pname("ssm_alpha.weight"));
+                    auto beta_p  = load_packed(pname("ssm_beta.weight"));
+                    lw.w_combined_packed.insert(lw.w_combined_packed.end(), qkv_p.begin(),   qkv_p.end());
+                    lw.w_combined_packed.insert(lw.w_combined_packed.end(), gate_p.begin(),  gate_p.end());
+                    lw.w_combined_packed.insert(lw.w_combined_packed.end(), alpha_p.begin(), alpha_p.end());
+                    lw.w_combined_packed.insert(lw.w_combined_packed.end(), beta_p.begin(),  beta_p.end());
+                } else {
+                    auto qkv_data = load_bf16(pname("attn_qkv.weight"));
+                    auto gate_data = load_bf16(pname("attn_gate.weight"));
+                    auto alpha_data = load_bf16(pname("ssm_alpha.weight"));
+                    auto beta_data = load_bf16(pname("ssm_beta.weight"));
 
-                uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
-                                       + MC::ssm_dt_rank + MC::ssm_dt_rank;
-                lw.w_combined_host.resize(combined_rows * MC::n_embd);
-                uint16_t* dst = lw.w_combined_host.data();
-                size_t off = 0;
-                memcpy(dst + off, qkv_data.data(), MC::ssm_conv_channels * MC::n_embd * 2);
-                off += MC::ssm_conv_channels * MC::n_embd;
-                memcpy(dst + off, gate_data.data(), MC::ssm_d_inner * MC::n_embd * 2);
-                off += MC::ssm_d_inner * MC::n_embd;
-                memcpy(dst + off, alpha_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
-                off += MC::ssm_dt_rank * MC::n_embd;
-                memcpy(dst + off, beta_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
+                    uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
+                                           + MC::ssm_dt_rank + MC::ssm_dt_rank;
+                    lw.w_combined_host.resize(combined_rows * MC::n_embd);
+                    uint16_t* dst = lw.w_combined_host.data();
+                    size_t off = 0;
+                    memcpy(dst + off, qkv_data.data(), MC::ssm_conv_channels * MC::n_embd * 2);
+                    off += MC::ssm_conv_channels * MC::n_embd;
+                    memcpy(dst + off, gate_data.data(), MC::ssm_d_inner * MC::n_embd * 2);
+                    off += MC::ssm_d_inner * MC::n_embd;
+                    memcpy(dst + off, alpha_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
+                    off += MC::ssm_dt_rank * MC::n_embd;
+                    memcpy(dst + off, beta_data.data(), MC::ssm_dt_rank * MC::n_embd * 2);
+                }
             }
 
             // SSM parameters — stored on host as f32
@@ -353,9 +391,13 @@ bool load_gguf_weights(
             lw.ssm_norm_host = load_f32(pname("ssm_norm.weight"));
 
             if (!skip_large_weights) {
-                auto ssm_out_data = load_bf16(pname("ssm_out.weight"));
-                lw.ssm_out_host.resize(ssm_out_data.size());
-                memcpy(lw.ssm_out_host.data(), ssm_out_data.data(), ssm_out_data.size() * 2);
+                if (gguf_is_bfp8) {
+                    lw.ssm_out_packed = load_packed(pname("ssm_out.weight"));
+                } else {
+                    auto ssm_out_data = load_bf16(pname("ssm_out.weight"));
+                    lw.ssm_out_host.resize(ssm_out_data.size());
+                    memcpy(lw.ssm_out_host.data(), ssm_out_data.data(), ssm_out_data.size() * 2);
+                }
             }
 
             // Post-attention norm — small, upload to device as BF16
@@ -363,18 +405,24 @@ bool load_gguf_weights(
             lw.post_attn_norm = upload_1d_bf16(device, cq, post_norm.data(), MC::n_embd);
 
             if (!skip_large_weights) {
-                // FFN: gate and up stored separately on host
-                auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
-                lw.ffn_gate_host.resize(ffn_gate.size());
-                memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
+                if (gguf_is_bfp8) {
+                    lw.ffn_gate_packed = load_packed(pname("ffn_gate.weight"));
+                    lw.ffn_up_packed   = load_packed(pname("ffn_up.weight"));
+                    lw.ffn_down_packed = load_packed(pname("ffn_down.weight"));
+                } else {
+                    // FFN: gate and up stored separately on host
+                    auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
+                    lw.ffn_gate_host.resize(ffn_gate.size());
+                    memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
 
-                auto ffn_up = load_bf16(pname("ffn_up.weight"));
-                lw.ffn_up_host.resize(ffn_up.size());
-                memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
+                    auto ffn_up = load_bf16(pname("ffn_up.weight"));
+                    lw.ffn_up_host.resize(ffn_up.size());
+                    memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
 
-                auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
-                lw.ffn_down_host.resize(ffn_down_data.size());
-                memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
+                    auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
+                    lw.ffn_down_host.resize(ffn_down_data.size());
+                    memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
+                }
             }
 
             printf("  Layer %d: SSM (delta-net) [%d]%s\n", il, ssm_idx,
@@ -388,24 +436,34 @@ bool load_gguf_weights(
             lw.attn_norm = upload_1d_bf16(device, cq, norm_data.data(), MC::n_embd);
 
             if (!skip_large_weights) {
-                // QKV: pack Q+K+V → [qkv_rows, n_embd] — store on host
                 int q_dim = MC::n_head * MC::head_dim * 2;
                 int kv_dim = MC::n_head_kv * MC::head_dim;
                 int qkv_rows = q_dim + 2 * kv_dim;
+                if (gguf_is_bfp8) {
+                    // Tile-concatenate Q, K, V along M (same K=n_embd)
+                    auto q_p = load_packed(pname("attn_q.weight"));
+                    auto k_p = load_packed(pname("attn_k.weight"));
+                    auto v_p = load_packed(pname("attn_v.weight"));
+                    lw.wqkv_packed.insert(lw.wqkv_packed.end(), q_p.begin(), q_p.end());
+                    lw.wqkv_packed.insert(lw.wqkv_packed.end(), k_p.begin(), k_p.end());
+                    lw.wqkv_packed.insert(lw.wqkv_packed.end(), v_p.begin(), v_p.end());
+                    lw.wo_packed = load_packed(pname("attn_output.weight"));
+                } else {
+                    // QKV: pack Q+K+V → [qkv_rows, n_embd] — store on host
+                    auto wq = load_bf16(pname("attn_q.weight"));
+                    auto wk = load_bf16(pname("attn_k.weight"));
+                    auto wv = load_bf16(pname("attn_v.weight"));
 
-                auto wq = load_bf16(pname("attn_q.weight"));
-                auto wk = load_bf16(pname("attn_k.weight"));
-                auto wv = load_bf16(pname("attn_v.weight"));
+                    lw.wqkv_host.resize(qkv_rows * MC::n_embd);
+                    memcpy(lw.wqkv_host.data(), wq.data(), q_dim * MC::n_embd * 2);
+                    memcpy(lw.wqkv_host.data() + q_dim * MC::n_embd, wk.data(), kv_dim * MC::n_embd * 2);
+                    memcpy(lw.wqkv_host.data() + (q_dim + kv_dim) * MC::n_embd, wv.data(), kv_dim * MC::n_embd * 2);
 
-                lw.wqkv_host.resize(qkv_rows * MC::n_embd);
-                memcpy(lw.wqkv_host.data(), wq.data(), q_dim * MC::n_embd * 2);
-                memcpy(lw.wqkv_host.data() + q_dim * MC::n_embd, wk.data(), kv_dim * MC::n_embd * 2);
-                memcpy(lw.wqkv_host.data() + (q_dim + kv_dim) * MC::n_embd, wv.data(), kv_dim * MC::n_embd * 2);
-
-                // Output projection — store on host
-                auto wo = load_bf16(pname("attn_output.weight"));
-                lw.wo_host.resize(wo.size());
-                memcpy(lw.wo_host.data(), wo.data(), wo.size() * 2);
+                    // Output projection — store on host
+                    auto wo = load_bf16(pname("attn_output.weight"));
+                    lw.wo_host.resize(wo.size());
+                    memcpy(lw.wo_host.data(), wo.data(), wo.size() * 2);
+                }
             }
 
             // Q/K norms — small, upload to device as BF16
@@ -419,18 +477,24 @@ bool load_gguf_weights(
             lw.post_attn_norm = upload_1d_bf16(device, cq, post_norm.data(), MC::n_embd);
 
             if (!skip_large_weights) {
-                // FFN: gate and up stored separately on host
-                auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
-                lw.ffn_gate_host.resize(ffn_gate.size());
-                memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
+                if (gguf_is_bfp8) {
+                    lw.ffn_gate_packed = load_packed(pname("ffn_gate.weight"));
+                    lw.ffn_up_packed   = load_packed(pname("ffn_up.weight"));
+                    lw.ffn_down_packed = load_packed(pname("ffn_down.weight"));
+                } else {
+                    // FFN: gate and up stored separately on host
+                    auto ffn_gate = load_bf16(pname("ffn_gate.weight"));
+                    lw.ffn_gate_host.resize(ffn_gate.size());
+                    memcpy(lw.ffn_gate_host.data(), ffn_gate.data(), ffn_gate.size() * 2);
 
-                auto ffn_up = load_bf16(pname("ffn_up.weight"));
-                lw.ffn_up_host.resize(ffn_up.size());
-                memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
+                    auto ffn_up = load_bf16(pname("ffn_up.weight"));
+                    lw.ffn_up_host.resize(ffn_up.size());
+                    memcpy(lw.ffn_up_host.data(), ffn_up.data(), ffn_up.size() * 2);
 
-                auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
-                lw.ffn_down_host.resize(ffn_down_data.size());
-                memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
+                    auto ffn_down_data = load_bf16(pname("ffn_down.weight"));
+                    lw.ffn_down_host.resize(ffn_down_data.size());
+                    memcpy(lw.ffn_down_host.data(), ffn_down_data.data(), ffn_down_data.size() * 2);
+                }
             }
 
             printf("  Layer %d: Attention [%d]%s\n", il, attn_idx,

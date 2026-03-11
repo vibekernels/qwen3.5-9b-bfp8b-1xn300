@@ -57,12 +57,23 @@ ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 # Targets
 .PHONY: all clean test quicktest setup chat serve
 
-all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat $(BUILD)/qwen-server
+all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat $(BUILD)/qwen-server $(BUILD)/make_bfp8_gguf
 
 # Auto-setup: init submodule + build tt-metal if SDK not found
+# Only the three required submodules (tracy, tt_llk, umd) are needed; skipping
+# the full --recursive init avoids cloning large demo submodules like llama2_70b.
+# Build flags:
+#   --without-python-bindings  skip _ttnncpp.so (~5-7 min saved)
+#   --without-distributed      skip OpenMPI (not needed for single-machine MeshDevice)
 $(TT_METAL_BUILD)/lib/libtt_metal.so:
-	git submodule update --init --recursive
-	cd $(TT_METAL_HOME) && ./build_metal.sh
+	git submodule update --init --depth 1 third_party/tt-metal
+	cd $(TT_METAL_HOME) && git submodule update --init --depth 1 \
+		tt_metal/third_party/tracy \
+		tt_metal/third_party/tt_llk \
+		tt_metal/third_party/umd
+	cd $(TT_METAL_HOME) && ./build_metal.sh \
+		--without-python-bindings \
+		--without-distributed
 
 setup: $(TT_METAL_BUILD)/lib/libtt_metal.so
 
@@ -110,6 +121,11 @@ serve: $(BUILD)/qwen-server
 		$(BUILD)/qwen-server \
 		-m $${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
 		--port $${PORT:-8888} 2>/dev/null
+
+# BFP8_B GGUF converter — CPU-only tool (no device needed)
+$(BUILD)/make_bfp8_gguf: tools/make_bfp8_gguf.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -march=$(MARCH) $< -o $@ $(LDFLAGS) $(TT_LIBS)
 
 # Standalone test targets (link directly against tt-metal)
 $(BUILD)/test_matmul: src/tests/test_matmul.cpp
