@@ -1,7 +1,7 @@
 #!/bin/bash
 
 PORT="${SERVER_PORT:-${PORT:-8888}}"
-MODEL="${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16}"
+MODEL="${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled}"
 CTX_SIZE="${CTX_SIZE:-4096}"
 
 # Start SSH server if a public key is provided

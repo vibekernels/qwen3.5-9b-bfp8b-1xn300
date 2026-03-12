@@ -331,7 +331,7 @@ header .model { font-size: 12px; color: #8b949e; background: #21262d; padding: 2
 </div>
 <header>
   <h1>Qwen3.5-9B</h1>
-  <span class="model">BF16 &bull; Tenstorrent N300</span>
+  <span class="model">BFP8B &bull; Tenstorrent N300</span>
 </header>
 <div id="chat"></div>
 <div id="input-area">
@@ -379,7 +379,7 @@ async function pollStatus() {
 
   while (true) {
     try {
-      const res = await fetch('/api/status');
+      const res = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
       const s = await res.json();
 
       if (s.state === 'downloading') {
