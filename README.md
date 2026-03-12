@@ -1,8 +1,8 @@
-# qwen3.5-9b-bfp8-1xn300
+# qwen3.5-9b-bfp8b-1xn300
 
 Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metalium APIs. No ttnn dependency — all matmuls, norms, and element-wise ops use custom Tensix kernels.
 
-[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=qwen3-5-9b-n300&type=docker&image=ghcr.io%2Fvibekernels%2Fqwen3.5-9b-bfp8-1xn300:latest&instance_type=gpu-tenstorrent-n300s&regions=na&instances_min=1&hc_grace_period%5B8888%5D=900&ports=8888;http;/&ports=22;tcp;;true;tcp&env%5BPUBLIC_KEY%5D=REPLACE_ME)
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=qwen3-5-9b-n300&type=docker&image=ghcr.io%2Fvibekernels%2Fqwen3.5-9b-bfp8b-1xn300:latest&instance_type=gpu-tenstorrent-n300s&regions=na&instances_min=1&hc_grace_period%5B8888%5D=900&ports=8888;http;/&ports=22;tcp;;true;tcp&env%5BPUBLIC_KEY%5D=REPLACE_ME)
 
 To enable SSH access, set `PUBLIC_KEY` to your SSH public key (e.g. contents of `~/.ssh/id_ed25519.pub`). Koyeb will assign a TCP proxy domain and port for SSH connections.
 
